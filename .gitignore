@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.cache/
+cache/
+*.log
+
+# Clipper artifacts
+artifacts/
+*.mp4
+*.mov
+*.wav
+*.mp3
+!tests/fixtures/*.mp4
+
+# Output files
+candidates.json
+*.candidates.json
