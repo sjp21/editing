@@ -10,6 +10,8 @@ dependencies = [
     "typer>=0.12",
     "numpy>=1.26",
     "python-dotenv>=1.0",
+    "mediapipe>=0.10",
+    "opencv-python-headless>=4.9",
 ]
 
 [project.optional-dependencies]
@@ -26,4 +28,4 @@ build-backend = "setuptools.build_meta"
 include = ["clipper*"]
 
 [tool.setuptools.package-data]
-clipper = ["prompts/*/*.md"]
+clipper = ["prompts/*/*.md", "assets/fonts/*.ttf"]

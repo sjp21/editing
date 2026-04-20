@@ -272,3 +272,72 @@ class Pass2aResult(BaseModel):
     candidates_shaped: int = 0
     candidates_killed: int = 0
     candidates_failed: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Pass 2b — Rendering
+# ---------------------------------------------------------------------------
+
+
+class RenderSettings(BaseModel):
+    width: int = 1080
+    height: int = 1920
+    fps: int = 30
+    video_codec: str = "libx264"
+    video_crf: int = 20
+    audio_codec: str = "aac"
+    audio_sample_rate: int = 48000
+    loudness_target_lufs: float = -14.0
+    loudness_true_peak_dbfs: float = -1.0
+    loudness_range_lu: float = 11.0
+    face_tracker: str = "opencv_haar"
+    crop_smoothing_halflife_s: float = 0.5
+
+
+class CaptionStyle(BaseModel):
+    font_family: str = "DejaVu Sans"
+    font_file: Path | None = None
+    font_size: int = 64
+    active_color: str = "#FFD400"
+    inactive_color: str = "#FFFFFF"
+    outline_color: str = "#000000"
+    outline_width: int = 3
+    position: Literal["top_third", "middle", "bottom_third"] = "bottom_third"
+    words_visible: int = 3
+
+
+class RenderedClip(BaseModel):
+    shaped_candidate_index: int
+    source_start: float
+    source_end: float
+    trim_start: float
+    trim_end: float
+    output_path: Path
+    output_sha256: str
+    input_fingerprint: str
+    output_duration_seconds: float
+    measured_integrated_lufs: float
+    face_coverage: float = Field(ge=0, le=1)
+    hook_overlay_text: str | None = None
+    settings: RenderSettings
+    caption_style: CaptionStyle
+    render_wall_seconds: float
+    render_version: str
+    source_video_sha256: str
+    source_transcript_sha256: str
+    font_file_sha256: str
+    source_shaped_prompt_version: str
+    source_pass1_prompt_version: str
+
+
+class Pass2bResult(BaseModel):
+    rendered: list[RenderedClip]
+    render_version: str
+    source_video_sha256: str
+    source_transcript_sha256: str
+    source_shaped_prompt_version: str
+    source_pass1_prompt_version: str
+    renders_completed: int = 0
+    renders_skipped_kill: int = 0
+    renders_skipped_fingerprint: int = 0
+    renders_failed: int = 0
