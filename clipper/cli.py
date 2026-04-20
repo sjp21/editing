@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -14,7 +16,8 @@ from clipper.frames import extract_frames
 from clipper.ingest import IngestConfig, extract_audio, transcribe
 from clipper.pass1 import DEFAULT_MODEL, Pass1Config, run_pass1
 from clipper.pass2a import Pass2aConfig, run_pass2a
-from clipper.schemas import Pass1Result
+from clipper.render import RenderConfig, run_pass2b
+from clipper.schemas import Pass1Result, Pass2aResult, Transcript
 from clipper.signals import compute_signals
 from clipper.windows import WindowConfig, build_windows
 
@@ -42,6 +45,12 @@ def process(
     shape_out: Path = typer.Option(
         Path("shaped.json"), "--shape-out", help="Pass 2a output JSON (when --shape)"
     ),
+    render: bool = typer.Option(
+        False, "--render/--no-render", help="Also run Pass 2b rendering (requires --shape)"
+    ),
+    render_dir: Path = typer.Option(
+        Path("clips"), "--render-dir", help="Output directory for rendered MP4s (when --render)"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Process a video into ranked candidate clips via Pass 1."""
@@ -50,6 +59,10 @@ def process(
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("clipper.cli")
+
+    # Fail fast before the pipeline — Pass 1 runs a paid Claude call per window.
+    if render and not shape:
+        raise typer.BadParameter("--render requires --shape")
 
     ingest_cfg = IngestConfig(
         whisper_model=whisper_model,
@@ -115,6 +128,9 @@ def process(
         log.info("running Pass 2a on %d candidates", len(result.candidates))
         shaped = run_pass2a(result, transcript, cfg=Pass2aConfig(model=model, effort=effort))
         shape_out.write_text(shaped.model_dump_json(indent=2))
+        # Persist the transcript sidecar so a standalone `render` call consumes
+        # bit-identical word timings. Downstream Pass 2b hashes this file.
+        transcript_sidecar = _write_transcript_sidecar(shape_out, transcript)
         log.info(
             "wrote %s — %d shaped, %d killed, %d failed",
             shape_out,
@@ -122,6 +138,21 @@ def process(
             shaped.candidates_killed,
             shaped.candidates_failed,
         )
+
+        if render:
+            log.info("running Pass 2b rendering into %s", render_dir)
+            transcript_sha = _sha256_file(transcript_sidecar)
+            pass2b = run_pass2b(
+                shaped, transcript, transcript_sha, video,
+                cfg=RenderConfig(out_dir=render_dir),
+            )
+            log.info(
+                "rendered %d, skipped_kill=%d, skipped_fp=%d, failed=%d",
+                pass2b.renders_completed,
+                pass2b.renders_skipped_kill,
+                pass2b.renders_skipped_fingerprint,
+                pass2b.renders_failed,
+            )
 
 
 @app.command()
@@ -159,9 +190,11 @@ def shape(
 
     shaped = run_pass2a(pass1, transcript, cfg=Pass2aConfig(model=model, effort=effort))
     out.write_text(shaped.model_dump_json(indent=2))
+    sidecar = _write_transcript_sidecar(out, transcript)
     log.info(
-        "wrote %s — %d shaped, %d killed, %d failed",
+        "wrote %s (+ %s) — %d shaped, %d killed, %d failed",
         out,
+        sidecar.name,
         shaped.candidates_shaped,
         shaped.candidates_killed,
         shaped.candidates_failed,
@@ -173,6 +206,88 @@ def shape(
         shaped.cache_read_tokens,
         shaped.cache_creation_tokens,
     )
+
+
+@app.command()
+def render(
+    video: Path = typer.Argument(..., exists=True, readable=True, help="Input video file"),
+    shaped: Path = typer.Option(
+        ..., "--shaped", "-s", exists=True, readable=True,
+        help="Pass2aResult JSON from a previous `shape` run",
+    ),
+    transcript: Path = typer.Option(
+        None, "--transcript", "-t",
+        help="Transcript JSON sidecar (defaults to <shaped>.transcript.json)",
+    ),
+    out_dir: Path = typer.Option(
+        Path("clips"), "--out-dir", "-o", help="Output directory for rendered MP4s"
+    ),
+    manifest: Path | None = typer.Option(
+        None, "--manifest", help="Manifest JSON path (defaults to <out-dir>/rendered.json)"
+    ),
+    no_skip: bool = typer.Option(
+        False, "--no-skip", help="Disable fingerprint-keyed skip (force re-render)"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Render Pass 2b clips from a saved Pass 2a result + transcript sidecar."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("clipper.cli")
+
+    transcript_path = transcript or Path(str(shaped) + ".transcript.json")
+    if not transcript_path.exists():
+        raise typer.BadParameter(
+            f"transcript sidecar not found at {transcript_path}. "
+            f"Run `clipper shape` first — it writes a sidecar next to shaped.json."
+        )
+
+    pass2a = Pass2aResult.model_validate_json(shaped.read_text())
+    tr = Transcript.model_validate_json(transcript_path.read_text())
+    tr_sha = _sha256_file(transcript_path)
+
+    cfg = RenderConfig(
+        out_dir=out_dir,
+        manifest_path=manifest,
+        skip_existing=not no_skip,
+    )
+
+    result = run_pass2b(pass2a, tr, tr_sha, video, cfg=cfg)
+    log.info(
+        "rendered %d, skipped_kill=%d, skipped_fp=%d, failed=%d",
+        result.renders_completed,
+        result.renders_skipped_kill,
+        result.renders_skipped_fingerprint,
+        result.renders_failed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_transcript_sidecar(shaped_out: Path, transcript: Transcript) -> Path:
+    """Write `<shaped_out>.transcript.json` atomically next to the shaped JSON."""
+    sidecar = Path(str(shaped_out) + ".transcript.json")
+    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+    try:
+        tmp.write_text(transcript.model_dump_json(indent=2))
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, sidecar)
+    return sidecar
+
+
+def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        while buf := f.read(chunk):
+            h.update(buf)
+    return h.hexdigest()
 
 
 def _print_summary(result, top_k: int = 10) -> None:
