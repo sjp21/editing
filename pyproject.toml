@@ -28,4 +28,4 @@ build-backend = "setuptools.build_meta"
 include = ["clipper*"]
 
 [tool.setuptools.package-data]
-clipper = ["prompts/*/*.md", "assets/fonts/*.ttf"]
+clipper = ["prompts/*/*.md", "assets/fonts/*.ttf", "assets/models/*.tflite"]

@@ -290,7 +290,7 @@ class RenderSettings(BaseModel):
     loudness_target_lufs: float = -14.0
     loudness_true_peak_dbfs: float = -1.0
     loudness_range_lu: float = 11.0
-    face_tracker: str = "opencv_haar"
+    face_tracker: str = "mediapipe_blazeface_short_range"
     crop_smoothing_halflife_s: float = 0.5
 
 
@@ -326,6 +326,7 @@ class RenderedClip(BaseModel):
     source_video_sha256: str
     source_transcript_sha256: str
     font_file_sha256: str
+    model_file_sha256: str = ""
     source_shaped_prompt_version: str
     source_pass1_prompt_version: str
 

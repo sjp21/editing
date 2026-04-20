@@ -36,6 +36,7 @@ def _rendered(**overrides) -> RenderedClip:
         source_video_sha256="9" * 64,
         source_transcript_sha256="7" * 64,
         font_file_sha256="4" * 64,
+        model_file_sha256="3" * 64,
         source_shaped_prompt_version="v1",
         source_pass1_prompt_version="v2",
     )
@@ -51,6 +52,7 @@ def test_rendered_roundtrip_preserves_provenance():
     assert back.source_transcript_sha256 == r.source_transcript_sha256
     assert back.render_version == "v1"
     assert back.face_coverage == pytest.approx(0.92)
+    assert back.model_file_sha256 == "3" * 64
 
 
 def test_face_coverage_bounds():
@@ -89,7 +91,7 @@ def test_settings_and_caption_defaults():
     assert s.width == 1080
     assert s.height == 1920
     assert s.loudness_target_lufs == -14.0
-    assert s.face_tracker == "opencv_haar"
+    assert s.face_tracker == "mediapipe_blazeface_short_range"
 
     c = CaptionStyle()
     assert c.words_visible == 3

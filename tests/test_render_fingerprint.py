@@ -97,6 +97,7 @@ def test_fingerprint_stable_across_invocations():
         "source_sha",
         "transcript_sha",
         "font_sha",
+        "model_sha",
         "caption_color",
         "setting_crf",
         "shaped_trim",
@@ -105,33 +106,37 @@ def test_fingerprint_stable_across_invocations():
 def test_fingerprint_flips_on_each_input(mutator, monkeypatch):
     sc = _shaped_keep()
     base = _compute_input_fingerprint(
-        sc, "src", "txt", "font", RenderSettings(), CaptionStyle()
+        sc, "src", "txt", "font", RenderSettings(), CaptionStyle(), model_sha="model"
     )
     if mutator == "source_sha":
         alt = _compute_input_fingerprint(
-            sc, "src2", "txt", "font", RenderSettings(), CaptionStyle()
+            sc, "src2", "txt", "font", RenderSettings(), CaptionStyle(), model_sha="model"
         )
     elif mutator == "transcript_sha":
         alt = _compute_input_fingerprint(
-            sc, "src", "txt2", "font", RenderSettings(), CaptionStyle()
+            sc, "src", "txt2", "font", RenderSettings(), CaptionStyle(), model_sha="model"
         )
     elif mutator == "font_sha":
         alt = _compute_input_fingerprint(
-            sc, "src", "txt", "font2", RenderSettings(), CaptionStyle()
+            sc, "src", "txt", "font2", RenderSettings(), CaptionStyle(), model_sha="model"
+        )
+    elif mutator == "model_sha":
+        alt = _compute_input_fingerprint(
+            sc, "src", "txt", "font", RenderSettings(), CaptionStyle(), model_sha="model2"
         )
     elif mutator == "caption_color":
         cs = CaptionStyle(active_color="#00FF00")
-        alt = _compute_input_fingerprint(sc, "src", "txt", "font", RenderSettings(), cs)
+        alt = _compute_input_fingerprint(sc, "src", "txt", "font", RenderSettings(), cs, model_sha="model")
     elif mutator == "setting_crf":
         rs = RenderSettings(video_crf=23)
-        alt = _compute_input_fingerprint(sc, "src", "txt", "font", rs, CaptionStyle())
+        alt = _compute_input_fingerprint(sc, "src", "txt", "font", rs, CaptionStyle(), model_sha="model")
     elif mutator == "shaped_trim":
         sc2 = _shaped_keep()
         sc2.trim = ShapedTrim(
             start_seconds=100.0, end_seconds=116.0, start_word="Most",
             end_word="three.", duration_seconds=16.0,
         )
-        alt = _compute_input_fingerprint(sc2, "src", "txt", "font", RenderSettings(), CaptionStyle())
+        alt = _compute_input_fingerprint(sc2, "src", "txt", "font", RenderSettings(), CaptionStyle(), model_sha="model")
     assert alt != base
 
 
@@ -140,7 +145,7 @@ def test_fingerprint_changes_on_render_version_bump(monkeypatch):
     base = _compute_input_fingerprint(
         sc, "src", "txt", "font", RenderSettings(), CaptionStyle()
     )
-    monkeypatch.setattr(rmod, "RENDER_VERSION", "v2")
+    monkeypatch.setattr(rmod, "RENDER_VERSION", "v99")
     bumped = _compute_input_fingerprint(
         sc, "src", "txt", "font", RenderSettings(), CaptionStyle()
     )
@@ -272,9 +277,11 @@ def test_run_pass2b_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
         prompt_version="v1",
         source_pass1_prompt_version="v2",
     )
-    # Freeze font resolution so the fingerprint is predictable.
+    # Freeze font + model resolution so the fingerprint is predictable.
     monkeypatch.setattr(rmod, "_resolve_font", lambda style, cache_dir: (tmp_path / "font.ttf", "FONT_SHA"))
+    monkeypatch.setattr(rmod, "_resolve_face_model", lambda cache_dir: (tmp_path / "model.tflite", "MODEL_SHA"))
     (tmp_path / "font.ttf").write_bytes(b"font")
+    (tmp_path / "model.tflite").write_bytes(b"model")
     monkeypatch.setattr(rmod, "_sha256_file", lambda p: {
         str(video): "SRC_SHA",
         str(mp4): "OUT_SHA",
@@ -282,7 +289,7 @@ def test_run_pass2b_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
 
     fp = _compute_input_fingerprint(
         shaped.shaped[0], "SRC_SHA", "T_SHA", "FONT_SHA",
-        RenderSettings(), CaptionStyle(),
+        RenderSettings(), CaptionStyle(), model_sha="MODEL_SHA",
     )
 
     # Seed a manifest matching that fingerprint.
@@ -315,7 +322,9 @@ def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
         source_pass1_prompt_version="v2",
     )
     monkeypatch.setattr(rmod, "_resolve_font", lambda style, cache_dir: (tmp_path / "font.ttf", "FONT_SHA"))
+    monkeypatch.setattr(rmod, "_resolve_face_model", lambda cache_dir: (tmp_path / "model.tflite", "MODEL_SHA"))
     (tmp_path / "font.ttf").write_bytes(b"font")
+    (tmp_path / "model.tflite").write_bytes(b"model")
     monkeypatch.setattr(rmod, "_sha256_file", lambda p: "ANY")
 
     # Seed a stale fingerprint so the skip guard sees a mismatch.
@@ -323,7 +332,7 @@ def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
 
     render_called = {"n": 0}
 
-    def _fake_render(sc, transcript, source, source_sha, transcript_sha, font_path, font_sha, cfg, fp, shaped_arg):
+    def _fake_render(sc, transcript, source, source_sha, transcript_sha, font_path, font_sha, model_path, model_sha, cfg, fp, shaped_arg):
         render_called["n"] += 1
         return RenderedClip(
             shaped_candidate_index=sc.candidate_index,
@@ -345,6 +354,7 @@ def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
             source_video_sha256=source_sha,
             source_transcript_sha256=transcript_sha,
             font_file_sha256=font_sha,
+            model_file_sha256=model_sha,
             source_shaped_prompt_version=shaped_arg.prompt_version,
             source_pass1_prompt_version=shaped_arg.source_pass1_prompt_version,
         )

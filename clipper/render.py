@@ -39,9 +39,10 @@ from clipper.schemas import (
 log = logging.getLogger(__name__)
 
 
-RENDER_VERSION = "v1"
+RENDER_VERSION = "v2"
 DEFAULT_LOG_PATH = Path(".cache/logs/pass2b.jsonl")
 BUNDLED_FONT_RESOURCE = "assets/fonts/DejaVuSans.ttf"
+BUNDLED_FACE_MODEL_RESOURCE = "assets/models/blaze_face_short_range.tflite"
 CROP_SAMPLE_FPS = 5.0
 
 
@@ -49,7 +50,7 @@ CROP_SAMPLE_FPS = 5.0
 class RenderConfig:
     settings: RenderSettings = field(default_factory=RenderSettings)
     caption_style: CaptionStyle = field(default_factory=CaptionStyle)
-    out_dir: Path = Path("clips")
+    out_dir: Path = Path("outputs/mp4")
     log_path: Path | None = DEFAULT_LOG_PATH
     skip_existing: bool = True
     manifest_path: Path | None = None  # rendered.json; defaults to out_dir/rendered.json
@@ -75,6 +76,7 @@ def run_pass2b(
 
     source_sha = _sha256_file(source_video)
     font_path, font_sha = _resolve_font(cfg.caption_style, cfg.cache_dir)
+    model_path, model_sha = _resolve_face_model(cfg.cache_dir)
 
     prior = _prior_manifest_for_skip(_manifest_path(cfg)) if cfg.skip_existing else {}
 
@@ -105,6 +107,7 @@ def run_pass2b(
                 font_sha=font_sha,
                 settings=cfg.settings,
                 caption_style=cfg.caption_style,
+                model_sha=model_sha,
             )
             skip = _should_skip(sc.candidate_index, fp, prior)
             if skip is not None:
@@ -122,6 +125,8 @@ def run_pass2b(
                 transcript_sha256,
                 font_path,
                 font_sha,
+                model_path,
+                model_sha,
                 cfg,
                 fp,
                 shaped,
@@ -159,12 +164,14 @@ def _compute_input_fingerprint(
     font_sha: str,
     settings: RenderSettings,
     caption_style: CaptionStyle,
+    model_sha: str = "",
 ) -> str:
     payload = {
         "render_version": RENDER_VERSION,
         "source_video_sha256": source_sha,
         "source_transcript_sha256": transcript_sha,
         "font_file_sha256": font_sha,
+        "model_file_sha256": model_sha,
         "shaped_clip": shaped_clip.model_dump(mode="json"),
         "render_settings": settings.model_dump(mode="json"),
         "caption_style": caption_style.model_dump(mode="json"),
@@ -219,6 +226,30 @@ def _resolve_font(style: CaptionStyle, cache_dir: Path) -> tuple[Path, str]:
     data = ref.read_bytes()
     sha = hashlib.sha256(data).hexdigest()
     out = cache_dir / "fonts" / f"DejaVuSans-{sha[:12]}.ttf"
+    if not out.exists():
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(out.suffix + ".tmp")
+        try:
+            tmp.write_bytes(data)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+        os.replace(tmp, out)
+    return out, sha
+
+
+def _resolve_face_model(cache_dir: Path) -> tuple[Path, str]:
+    """Materialize the bundled MediaPipe model to a stable on-disk path.
+
+    MediaPipe's ``BaseOptions(model_asset_path=...)`` takes a filesystem path, so
+    we must hand it a concrete file — the Traversable yielded by
+    ``importlib.resources`` is not guaranteed to be a real path under zipapp /
+    PyInstaller. Same materialize-once pattern as ``_resolve_font``.
+    """
+    ref = resources.files("clipper").joinpath(BUNDLED_FACE_MODEL_RESOURCE)
+    data = ref.read_bytes()
+    sha = hashlib.sha256(data).hexdigest()
+    out = cache_dir / "models" / f"blaze_face_short_range-{sha[:12]}.tflite"
     if not out.exists():
         out.parent.mkdir(parents=True, exist_ok=True)
         tmp = out.with_suffix(out.suffix + ".tmp")
@@ -438,59 +469,103 @@ class CropPoint:
 
 
 def _compute_crop_path(
-    source: Path, trim_start: float, trim_end: float, cfg: RenderConfig
+    source: Path,
+    trim_start: float,
+    trim_end: float,
+    cfg: RenderConfig,
+    model_path: Path,
 ) -> list[CropPoint]:
     """Sample faces at CROP_SAMPLE_FPS across the trim.
 
-    Uses OpenCV's bundled Haar cascade. No external model download; deterministic
-    across machines with the same opencv build. See docs/technical-decisions.md
-    for the rationale and the upgrade path to a deep-learning detector.
+    Uses MediaPipe Tasks ``FaceDetector`` in VIDEO mode with the bundled
+    BlazeFace short-range model. Largest detection wins (single-subject case).
+
+    Frames come from ffmpeg (rawvideo / rgb24 piped over stdout), not
+    ``cv2.VideoCapture``. The opencv-python-headless wheel's bundled ffmpeg
+    build lacks libdav1d, so AV1 sources (common in WebM recordings) silently
+    fail every ``read()`` and the detector sees zero frames. The system ffmpeg
+    we already depend on handles AV1 natively. See docs/technical-decisions.md.
     """
     try:
-        import cv2  # type: ignore[import-not-found]
+        import mediapipe as mp  # type: ignore[import-not-found]
+        import numpy as np
+        from mediapipe.tasks import python as mp_python  # type: ignore[import-not-found]
+        from mediapipe.tasks.python import vision as mp_vision  # type: ignore[import-not-found]
     except ImportError as e:
-        log.warning("opencv unavailable (%s); falling back to center crop", e)
+        log.warning("mediapipe/numpy unavailable (%s); falling back to center crop", e)
         return [CropPoint(t=trim_start, cx=None, cy=None)]
 
-    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-    if not cascade_path.exists():
-        log.warning("haar cascade missing at %s; falling back to center crop", cascade_path)
-        return [CropPoint(t=trim_start, cx=None, cy=None)]
-    detector = cv2.CascadeClassifier(str(cascade_path))
+    src_w, src_h = _probe_video_dims(source, cfg.ffprobe_bin)
+    frame_bytes = src_w * src_h * 3  # rgb24
 
-    cap = cv2.VideoCapture(str(source))
-    if not cap.isOpened():
-        raise RuntimeError(f"could not open video: {source}")
+    # -vsync cfr + -r forces the output stream to a constant CROP_SAMPLE_FPS
+    # regardless of the source's frame rate / timebase. Combined with the
+    # trim, the Nth emitted frame corresponds to t = trim_start + N / fps.
+    cmd = [
+        cfg.ffmpeg_bin,
+        "-hide_banner", "-nostats", "-loglevel", "error",
+        "-nostdin",
+        "-ss", f"{trim_start:.3f}",
+        "-to", f"{trim_end:.3f}",
+        "-i", str(source),
+        "-vsync", "cfr",
+        "-r", f"{CROP_SAMPLE_FPS}",
+        "-pix_fmt", "rgb24",
+        "-f", "rawvideo",
+        "pipe:1",
+    ]
 
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    step = max(1, int(round(src_fps / CROP_SAMPLE_FPS)))
-    start_frame = int(round(trim_start * src_fps))
-    end_frame = int(round(trim_end * src_fps))
+    options = mp_vision.FaceDetectorOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        min_detection_confidence=0.5,
+    )
 
     points: list[CropPoint] = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
-        for f_idx in range(start_frame, end_frame + 1, step):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ok, frame = cap.read()
-            if not ok:
-                continue
-            t = f_idx / src_fps
-            h, w = frame.shape[:2]
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector.detectMultiScale(
-                gray, scaleFactor=1.2, minNeighbors=5,
-                minSize=(max(30, w // 20), max(30, h // 20)),
-            )
-            if len(faces) > 0:
-                # Largest detection wins (single-subject case).
-                x, y, fw, fh = max(faces, key=lambda r: r[2] * r[3])
-                cx = (x + fw / 2) / w
-                cy = (y + fh / 2) / h
-                points.append(CropPoint(t=t, cx=cx, cy=cy))
-            else:
-                points.append(CropPoint(t=t, cx=None, cy=None))
+        with mp_vision.FaceDetector.create_from_options(options) as detector:
+            last_ts_ms = -1
+            frame_idx = 0
+            assert proc.stdout is not None
+            while True:
+                buf = proc.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes:
+                    break
+                frame_rgb = np.frombuffer(buf, dtype=np.uint8).reshape(src_h, src_w, 3)
+
+                t = trim_start + frame_idx / CROP_SAMPLE_FPS
+                ts_ms = int(round(t * 1000))
+                if ts_ms <= last_ts_ms:
+                    ts_ms = last_ts_ms + 1
+                last_ts_ms = ts_ms
+                frame_idx += 1
+
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+                result = detector.detect_for_video(mp_image, ts_ms)
+
+                if result.detections:
+                    best = max(
+                        result.detections,
+                        key=lambda d: d.bounding_box.width * d.bounding_box.height,
+                    )
+                    bb = best.bounding_box
+                    cx = (bb.origin_x + bb.width / 2) / src_w
+                    cy = (bb.origin_y + bb.height / 2) / src_h
+                    points.append(CropPoint(t=t, cx=cx, cy=cy))
+                else:
+                    points.append(CropPoint(t=t, cx=None, cy=None))
     finally:
-        cap.release()
+        if proc.stdout is not None:
+            proc.stdout.close()
+        stderr = proc.stderr.read() if proc.stderr is not None else b""
+        if proc.stderr is not None:
+            proc.stderr.close()
+        rc = proc.wait()
+        if rc != 0:
+            raise RuntimeError(
+                f"ffmpeg frame-extraction exited {rc}: {stderr.decode(errors='replace')[:400]}"
+            )
 
     if not points:
         return [CropPoint(t=trim_start, cx=None, cy=None)]
@@ -785,6 +860,8 @@ def _render_one(
     transcript_sha: str,
     font_path: Path,
     font_sha: str,
+    model_path: Path,
+    model_sha: str,
     cfg: RenderConfig,
     fingerprint: str,
     shaped: Pass2aResult,
@@ -814,9 +891,9 @@ def _render_one(
         out_path=ass_path,
     )
 
-    # Crop path — static median for v1.
+    # Crop path — static median per clip.
     src_w, src_h = _probe_video_dims(source, cfg.ffprobe_bin)
-    crop_points = _compute_crop_path(source, trim_start, trim_end, cfg)
+    crop_points = _compute_crop_path(source, trim_start, trim_end, cfg, model_path)
     smoothed = _smooth_crop_path(crop_points, cfg.settings.crop_smoothing_halflife_s)
     # face_coverage documents the detector hit rate, so it must be measured on
     # the raw series — _smooth_crop_path fills gaps forward from the last valid
@@ -874,6 +951,7 @@ def _render_one(
         source_video_sha256=source_sha,
         source_transcript_sha256=transcript_sha,
         font_file_sha256=font_sha,
+        model_file_sha256=model_sha,
         source_shaped_prompt_version=shaped.prompt_version,
         source_pass1_prompt_version=shaped.source_pass1_prompt_version,
     )
@@ -935,6 +1013,7 @@ def _log_entry_rendered(r: RenderedClip, shaped: Pass2aResult) -> dict:
         "source_video_sha256": r.source_video_sha256,
         "source_transcript_sha256": r.source_transcript_sha256,
         "font_file_sha256": r.font_file_sha256,
+        "model_file_sha256": r.model_file_sha256,
         "output_duration": r.output_duration_seconds,
         "measured_lufs": r.measured_integrated_lufs,
         "hook_overlay_text": r.hook_overlay_text,

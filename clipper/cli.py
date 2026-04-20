@@ -29,7 +29,9 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 @app.command()
 def process(
     video: Path = typer.Argument(..., exists=True, readable=True, help="Input video file"),
-    out: Path = typer.Option(Path("candidates.json"), "--out", "-o", help="Output JSON"),
+    out: Path = typer.Option(
+        Path("outputs/json/candidates.json"), "--out", "-o", help="Output JSON"
+    ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", help="Claude model id"),
     whisper_model: str = typer.Option("small", "--whisper", help="faster-whisper model size"),
     whisper_device: str = typer.Option("auto", "--device", help="cpu | cuda | auto"),
@@ -43,13 +45,15 @@ def process(
     ),
     shape: bool = typer.Option(False, "--shape/--no-shape", help="Also run Pass 2a shaping"),
     shape_out: Path = typer.Option(
-        Path("shaped.json"), "--shape-out", help="Pass 2a output JSON (when --shape)"
+        Path("outputs/json/shaped.json"), "--shape-out",
+        help="Pass 2a output JSON (when --shape)",
     ),
     render: bool = typer.Option(
         False, "--render/--no-render", help="Also run Pass 2b rendering (requires --shape)"
     ),
     render_dir: Path = typer.Option(
-        Path("clips"), "--render-dir", help="Output directory for rendered MP4s (when --render)"
+        Path("outputs/mp4"), "--render-dir",
+        help="Output directory for rendered MP4s (when --render)",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -106,6 +110,7 @@ def process(
     )
     result = run_pass1(windows, cfg=pass1_cfg)
 
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(result.model_dump_json(indent=2))
     log.info(
         "wrote %s — %d candidates (%d windows processed, %d rejected)",
@@ -127,6 +132,7 @@ def process(
     if shape:
         log.info("running Pass 2a on %d candidates", len(result.candidates))
         shaped = run_pass2a(result, transcript, cfg=Pass2aConfig(model=model, effort=effort))
+        shape_out.parent.mkdir(parents=True, exist_ok=True)
         shape_out.write_text(shaped.model_dump_json(indent=2))
         # Persist the transcript sidecar so a standalone `render` call consumes
         # bit-identical word timings. Downstream Pass 2b hashes this file.
@@ -162,7 +168,9 @@ def shape(
         ..., "--candidates", "-c", exists=True, readable=True,
         help="Pass1Result JSON from a previous `process` run",
     ),
-    out: Path = typer.Option(Path("shaped.json"), "--out", "-o", help="Output JSON"),
+    out: Path = typer.Option(
+        Path("outputs/json/shaped.json"), "--out", "-o", help="Output JSON"
+    ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", help="Claude model id"),
     whisper_model: str = typer.Option("small", "--whisper", help="faster-whisper model size"),
     whisper_device: str = typer.Option("auto", "--device", help="cpu | cuda | auto"),
@@ -189,6 +197,7 @@ def shape(
     transcript = transcribe(audio, ingest_cfg)
 
     shaped = run_pass2a(pass1, transcript, cfg=Pass2aConfig(model=model, effort=effort))
+    out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(shaped.model_dump_json(indent=2))
     sidecar = _write_transcript_sidecar(out, transcript)
     log.info(
@@ -220,7 +229,7 @@ def render(
         help="Transcript JSON sidecar (defaults to <shaped>.transcript.json)",
     ),
     out_dir: Path = typer.Option(
-        Path("clips"), "--out-dir", "-o", help="Output directory for rendered MP4s"
+        Path("outputs/mp4"), "--out-dir", "-o", help="Output directory for rendered MP4s"
     ),
     manifest: Path | None = typer.Option(
         None, "--manifest", help="Manifest JSON path (defaults to <out-dir>/rendered.json)"

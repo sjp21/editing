@@ -4,15 +4,15 @@ Living record of library and parameter choices for the clipper pipeline. Revisab
 
 ## Pass 2b — Rendering
 
-### Face tracker: OpenCV Haar cascade (`haarcascade_frontalface_default.xml`)
+### Face tracker: MediaPipe Tasks `FaceDetector` (BlazeFace short-range)
 
-The cascade XML ships inside the opencv-python-headless wheel (at `cv2.data.haarcascades`), so no runtime model download is required and determinism is scoped to the opencv build, not to network state.
+Detector: MediaPipe Tasks API `FaceDetector` running the bundled `blaze_face_short_range.tflite` model, shipped under `clipper/assets/models/`. Running mode is VIDEO (`detect_for_video`) — inter-frame continuity, monotonic timestamp input — with `min_detection_confidence=0.5`. Largest detection wins (single-subject case — interviews and podcasts).
 
-Parameters: `detectMultiScale(scaleFactor=1.2, minNeighbors=5, minSize=(max(30, w/20), max(30, h/20)))`. Largest detection wins (single-subject case — interviews and podcasts).
-
-Limitation: Haar is less robust than a modern DL detector on profile faces and heavy motion blur. It is the cheapest dependency available in the current build environment with zero-download semantics. Upgrade path: swap in MediaPipe's Tasks API `FaceDetector` with a bundled `blaze_face_short_range.task` model — that's a `RENDER_VERSION=v2` change (fingerprint flips, old `rendered.json` stays joinable, every keep re-renders). The plan originally specified MediaPipe; the `mediapipe>=0.10.15` release removed the legacy `mp.solutions.face_detection` module, and the replacement Tasks API needs a downloaded model that isn't vendored in this tree yet.
+Determinism: MediaPipe Tasks produces deterministic outputs for a fixed model file + input frame, so we pin the model sha256, not just the mediapipe library version. The model file hash is folded into `input_fingerprint` and serialized onto every `RenderedClip.model_file_sha256`, so a model swap forces a re-render for every clip.
 
 Multi-subject framing stays a compromise crop regardless of detector; that non-goal is owned by VISION.
+
+**Retired in v2 (Haar cascade).** v1 used OpenCV's bundled `haarcascade_frontalface_default.xml`. In practice Haar missed faces in real footage (see `clips/rendered.json` v1 render with `face_coverage: 0.0` on a clip with visible faces), so the fallback center crop was being hit for every frame. The BlazeFace upgrade is a `RENDER_VERSION = v1 → v2` change: `face_tracker` default flipped from `"opencv_haar"` to `"mediapipe_blazeface_short_range"`, `model_file_sha256` was added to the fingerprint inputs and the schema, and every prior `rendered.json` entry deterministically mismatches the new fingerprint and re-renders on next invocation.
 
 ### Loudness target: −14 LUFS integrated, −1 dBTP true peak, 11 LU range
 
@@ -43,8 +43,8 @@ Byte-identical output is guaranteed when `input_fingerprint` is constant *and* t
 Pinned reference environment:
 - **ffmpeg**: >= 6.1 (x264-enabled). Tested on ffmpeg 6.1.1 (Ubuntu 24.04 apt build).
 - **libx264**: whatever ships in the above. We do not promise bit-identical output across libx264 ABI changes.
-- **opencv-python-headless**: >= 4.9 (ships the Haar cascade we use).
-- **mediapipe**: >= 0.10 (installed for a future `RENDER_VERSION=v2` face-tracker swap; not on the hot path in v1).
+- **opencv-python-headless**: >= 4.9 (video frame decoding + color conversion feeding MediaPipe).
+- **mediapipe**: >= 0.10 (Tasks `FaceDetector` on the render hot path).
 
 Cross-version libx264 reproducibility is explicitly not promised. If you change ffmpeg / libx264 / mediapipe major versions, bump `RENDER_VERSION` so the feedback loop can segregate outcomes by rendering stack.
 
