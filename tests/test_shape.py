@@ -1,4 +1,4 @@
-"""Pass 2a parsing, validation, and mocked end-to-end tests."""
+"""Shape parsing, validation, and mocked end-to-end tests."""
 
 from __future__ import annotations
 
@@ -8,17 +8,17 @@ from types import SimpleNamespace
 
 import pytest
 
-from clipper import pass2a
-from clipper.pass2a import (
-    Pass2aConfig,
+from clipper import shape
+from clipper.shape import (
+    ShapeConfig,
     _parse_and_validate,
     _extract_context,
     _format_words_table,
-    run_pass2a,
+    run_shape,
 )
 from clipper.schemas import (
     Candidate,
-    Pass1Result,
+    ScoreResult,
     Scores,
     Transcript,
     TranscriptSegment,
@@ -206,7 +206,7 @@ def test_format_words_table_is_one_per_line():
 
 
 def _parse(text, cand, words):
-    return _parse_and_validate(text, cand, idx=0, ctx_words=words, cfg=Pass2aConfig())
+    return _parse_and_validate(text, cand, idx=0, ctx_words=words, cfg=ShapeConfig())
 
 
 def test_parse_keep_valid():
@@ -281,36 +281,36 @@ def test_parse_rejects_word_timestamp_mismatch():
 
 
 def test_parse_retry_then_success(monkeypatch, tmp_path):
-    # End-to-end via run_pass2a so the retry loop is exercised.
+    # End-to-end via run_shape so the retry loop is exercised.
     words_spec = _default_words()
     tr = _build_transcript(words_spec)
     cand = _candidate(100.0, 117.0)
-    pass1 = Pass1Result(candidates=[cand], model="m", prompt_version="v1")
+    scored = ScoreResult(candidates=[cand], model="m", prompt_version="v1")
 
     start_word = _find_word_at(words_spec, 100.0, "start")
     end_ts = next(e for s, e, w in words_spec if w == "charging")
     good = _keep_json(start=100.0, end=end_ts, start_word=start_word, end_word="charging")
 
     client = _FakeClient([_response("not json"), _response(good)])
-    monkeypatch.setattr(pass2a.time, "sleep", lambda *_: None)
-    cfg = Pass2aConfig(log_path=tmp_path / "log.jsonl")
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
+    cfg = ShapeConfig(log_path=tmp_path / "log.jsonl")
 
-    result = run_pass2a(pass1, tr, cfg=cfg, client=client)
+    result = run_shape(scored, tr, cfg=cfg, client=client)
     assert result.candidates_shaped == 1
     assert len(client.calls) == 2
 
 
 # ---------------------------------------------------------------------------
-# run_pass2a — aggregation + log line
+# run_shape — aggregation + log line
 # ---------------------------------------------------------------------------
 
 
-def test_run_pass2a_aggregates_and_logs(monkeypatch, tmp_path):
+def test_run_shape_aggregates_and_logs(monkeypatch, tmp_path):
     words_spec = _default_words()
     tr = _build_transcript(words_spec)
     cand_a = _candidate(100.0, 117.0)
     cand_b = _candidate(100.0, 117.0)
-    pass1 = Pass1Result(
+    scored = ScoreResult(
         candidates=[cand_a, cand_b],
         model="m",
         prompt_version="v1",
@@ -320,16 +320,16 @@ def test_run_pass2a_aggregates_and_logs(monkeypatch, tmp_path):
     end_ts = next(e for s, e, w in words_spec if w == "charging")
     keep_text = _keep_json(start=100.0, end=end_ts, start_word=start_word, end_word="charging")
 
-    log_path = tmp_path / "pass2a.jsonl"
-    monkeypatch.setattr(pass2a.time, "sleep", lambda *_: None)
+    log_path = tmp_path / "shape.jsonl"
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
 
     client = _FakeClient([
         _response(keep_text, _FakeUsage(100, 50, 0, 200)),
         _response(_kill_json(), _FakeUsage(110, 30, 200, 0)),
     ])
 
-    cfg = Pass2aConfig(log_path=log_path)
-    result = run_pass2a(pass1, tr, cfg=cfg, client=client)
+    cfg = ShapeConfig(log_path=log_path)
+    result = run_shape(scored, tr, cfg=cfg, client=client)
 
     assert result.candidates_shaped == 1
     assert result.candidates_killed == 1
@@ -338,7 +338,7 @@ def test_run_pass2a_aggregates_and_logs(monkeypatch, tmp_path):
     assert result.total_output_tokens == 80
     assert result.cache_read_tokens == 200
     assert result.cache_creation_tokens == 200
-    assert result.source_pass1_prompt_version == "v1"
+    assert result.source_score_prompt_version == "v1"
     assert result.prompt_version == "v1"
 
     # candidate_index is preserved positionally.
@@ -350,8 +350,8 @@ def test_run_pass2a_aggregates_and_logs(monkeypatch, tmp_path):
     assert len(lines) == 2
     entry0 = json.loads(lines[0])
     entry1 = json.loads(lines[1])
-    assert entry0["stage"] == "pass2a"
-    assert entry0["source_pass1_prompt_version"] == "v1"
+    assert entry0["stage"] == "shape"
+    assert entry0["source_score_prompt_version"] == "v1"
     assert entry0["verdict"] == "keep"
     assert entry0["trim_start"] == 100.0
     assert entry0["hook_kind"] == "rewrite"
@@ -360,43 +360,43 @@ def test_run_pass2a_aggregates_and_logs(monkeypatch, tmp_path):
     assert entry1["kill_reason"]
 
 
-def test_run_pass2a_counts_failures(monkeypatch, tmp_path):
+def test_run_shape_counts_failures(monkeypatch, tmp_path):
     tr = _build_transcript(_default_words())
-    pass1 = Pass1Result(
+    scored = ScoreResult(
         candidates=[_candidate(100.0, 117.0)],
         model="m",
         prompt_version="v1",
     )
-    monkeypatch.setattr(pass2a.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
 
     # Always malformed — retries exhaust.
     responses = [_response("not json") for _ in range(5)]
     client = _FakeClient(responses)
 
-    cfg = Pass2aConfig(log_path=tmp_path / "log.jsonl", max_retries=1)
-    result = run_pass2a(pass1, tr, cfg=cfg, client=client)
+    cfg = ShapeConfig(log_path=tmp_path / "log.jsonl", max_retries=1)
+    result = run_shape(scored, tr, cfg=cfg, client=client)
     assert result.candidates_failed == 1
     assert result.candidates_shaped == 0
     assert not (tmp_path / "log.jsonl").exists()
 
 
-def test_run_pass2a_caches_system_prompt(monkeypatch, tmp_path):
+def test_run_shape_caches_system_prompt(monkeypatch, tmp_path):
     tr = _build_transcript(_default_words())
-    pass1 = Pass1Result(
+    scored = ScoreResult(
         candidates=[_candidate(100.0, 117.0)],
         model="m",
         prompt_version="v1",
     )
-    monkeypatch.setattr(pass2a.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
 
     client = _FakeClient([_response(_kill_json())])
-    cfg = Pass2aConfig(log_path=tmp_path / "log.jsonl")
-    run_pass2a(pass1, tr, cfg=cfg, client=client)
+    cfg = ShapeConfig(log_path=tmp_path / "log.jsonl")
+    run_shape(scored, tr, cfg=cfg, client=client)
 
     sent = client.calls[0]
     sys_block = sent["system"][0]
     assert sys_block["cache_control"] == {"type": "ephemeral"}
-    assert sent["model"] == Pass2aConfig().model
+    assert sent["model"] == ShapeConfig().model
     assert sent["thinking"] == {"type": "adaptive"}
     assert sent["output_config"] == {"effort": "high"}
 
@@ -407,6 +407,118 @@ def test_run_pass2a_caches_system_prompt(monkeypatch, tmp_path):
 
 
 def test_shaping_rubric_loads_from_package():
-    rubric = pass2a._load_rubric(None)
+    rubric = shape._load_rubric(None)
     assert "Shaping" in rubric or "shaping" in rubric
     assert "[PLATFORM_PROFILE]" in rubric
+
+
+# ---------------------------------------------------------------------------
+# Platform profile
+# ---------------------------------------------------------------------------
+
+
+def test_shape_profile_missing_raises(monkeypatch, tmp_path):
+    tr = _build_transcript(_default_words())
+    scored = ScoreResult(
+        candidates=[_candidate(100.0, 117.0)],
+        model="m",
+        prompt_version="v1",
+    )
+    cfg = ShapeConfig(
+        profile="tiktok",
+        profiles_dir=tmp_path / "does_not_exist",
+        log_path=tmp_path / "log.jsonl",
+    )
+    client = _FakeClient([])  # must not be called
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
+
+    with pytest.raises(FileNotFoundError, match="tiktok"):
+        run_shape(scored, tr, cfg=cfg, client=client)
+    assert len(client.calls) == 0
+
+
+def test_shape_profile_loaded_and_injected(monkeypatch, tmp_path):
+    words_spec = _default_words()
+    tr = _build_transcript(words_spec)
+    cand = _candidate(100.0, 117.0)
+    scored = ScoreResult(candidates=[cand], model="m", prompt_version="v1")
+
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "tiktok.md").write_text("TIKTOK_SENTINEL_PROFILE_TEXT")
+
+    start_word = _find_word_at(words_spec, 100.0, "start")
+    end_ts = next(e for s, e, w in words_spec if w == "charging")
+    good = _keep_json(start=100.0, end=end_ts, start_word=start_word, end_word="charging")
+
+    client = _FakeClient([_response(good)])
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
+    cfg = ShapeConfig(
+        profile="tiktok",
+        profiles_dir=profiles_dir,
+        log_path=tmp_path / "log.jsonl",
+    )
+    result = run_shape(scored, tr, cfg=cfg, client=client)
+
+    assert result.profile == "tiktok"
+    sys_text = client.calls[0]["system"][0]["text"]
+    assert "TIKTOK_SENTINEL_PROFILE_TEXT" in sys_text
+
+
+def test_shape_profile_with_backslashes_is_literal(monkeypatch, tmp_path):
+    """Profile text containing backslash sequences must round-trip verbatim
+    into the rubric — not be interpreted as a re.sub replacement template."""
+    words_spec = _default_words()
+    tr = _build_transcript(words_spec)
+    cand = _candidate(100.0, 117.0)
+    scored = ScoreResult(candidates=[cand], model="m", prompt_version="v1")
+
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    hazard = "See C:\\Users\\foo; regex: \\1 captures; LaTeX: \\gamma"
+    (profiles_dir / "tiktok.md").write_text(hazard)
+
+    start_word = _find_word_at(words_spec, 100.0, "start")
+    end_ts = next(e for s, e, w in words_spec if w == "charging")
+    good = _keep_json(start=100.0, end=end_ts, start_word=start_word, end_word="charging")
+
+    client = _FakeClient([_response(good)])
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
+    cfg = ShapeConfig(
+        profile="tiktok",
+        profiles_dir=profiles_dir,
+        log_path=tmp_path / "log.jsonl",
+    )
+    result = run_shape(scored, tr, cfg=cfg, client=client)
+
+    assert result.profile == "tiktok"
+    sys_text = client.calls[0]["system"][0]["text"]
+    assert hazard in sys_text
+
+
+def test_shape_profile_recorded_in_provenance(monkeypatch, tmp_path):
+    """ShapeResult.profile and each shape.jsonl row must carry the profile name."""
+    words_spec = _default_words()
+    tr = _build_transcript(words_spec)
+    cand = _candidate(100.0, 117.0)
+    scored = ScoreResult(candidates=[cand], model="m", prompt_version="v1")
+
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "fake.md").write_text("irrelevant")
+
+    start_word = _find_word_at(words_spec, 100.0, "start")
+    end_ts = next(e for s, e, w in words_spec if w == "charging")
+    good = _keep_json(start=100.0, end=end_ts, start_word=start_word, end_word="charging")
+
+    log_path = tmp_path / "shape.jsonl"
+    client = _FakeClient([_response(good)])
+    monkeypatch.setattr(shape.time, "sleep", lambda *_: None)
+    cfg = ShapeConfig(profile="fake", profiles_dir=profiles_dir, log_path=log_path)
+
+    result = run_shape(scored, tr, cfg=cfg, client=client)
+
+    assert result.profile == "fake"
+    line = log_path.read_text().splitlines()[0]
+    entry = json.loads(line)
+    assert entry["profile"] == "fake"

@@ -1,4 +1,4 @@
-"""Pass 2b — Rendering.
+"""Render — deterministic 9:16 MP4 with captions + loudness + face crop.
 
 Deterministic renderer that consumes a ``ShapedClip`` + pinned ``Transcript``
 + source video and produces a 9:16 MP4 with burned word-by-word captions,
@@ -7,7 +7,7 @@ EBU R128 loudness-normalized audio, and an optional hook overlay.
 No Claude call. No STT call. This stage is dumb on purpose: any change to
 visible output (typography, crop, codec, loudness, font) must bump
 ``RENDER_VERSION`` so old ``rendered.json`` files stay joinable to outcome
-data. Mirrors the ``PROMPT_VERSION`` discipline in ``pass1.py`` / ``pass2a.py``.
+data. Mirrors the ``PROMPT_VERSION`` discipline in ``score.py`` / ``shape.py``.
 """
 
 from __future__ import annotations
@@ -27,10 +27,10 @@ from pathlib import Path
 
 from clipper.schemas import (
     CaptionStyle,
-    Pass2aResult,
-    Pass2bResult,
     RenderedClip,
+    RenderResult,
     RenderSettings,
+    ShapeResult,
     ShapedClip,
     Transcript,
     TranscriptWord,
@@ -40,7 +40,6 @@ log = logging.getLogger(__name__)
 
 
 RENDER_VERSION = "v2"
-DEFAULT_LOG_PATH = Path(".cache/logs/pass2b.jsonl")
 BUNDLED_FONT_RESOURCE = "assets/fonts/DejaVuSans.ttf"
 BUNDLED_FACE_MODEL_RESOURCE = "assets/models/blaze_face_short_range.tflite"
 CROP_SAMPLE_FPS = 5.0
@@ -48,10 +47,10 @@ CROP_SAMPLE_FPS = 5.0
 
 @dataclass
 class RenderConfig:
+    out_dir: Path
     settings: RenderSettings = field(default_factory=RenderSettings)
     caption_style: CaptionStyle = field(default_factory=CaptionStyle)
-    out_dir: Path = Path("outputs/mp4")
-    log_path: Path | None = DEFAULT_LOG_PATH
+    log_path: Path | None = None
     skip_existing: bool = True
     manifest_path: Path | None = None  # rendered.json; defaults to out_dir/rendered.json
     ffmpeg_bin: str = "ffmpeg"
@@ -64,14 +63,13 @@ class RenderConfig:
 # ---------------------------------------------------------------------------
 
 
-def run_pass2b(
-    shaped: Pass2aResult,
+def run_render(
+    shaped: ShapeResult,
     transcript: Transcript,
     transcript_sha256: str,
     source_video: Path,
-    cfg: RenderConfig | None = None,
-) -> Pass2bResult:
-    cfg = cfg or RenderConfig()
+    cfg: RenderConfig,
+) -> RenderResult:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
 
     source_sha = _sha256_file(source_video)
@@ -80,13 +78,13 @@ def run_pass2b(
 
     prior = _prior_manifest_for_skip(_manifest_path(cfg)) if cfg.skip_existing else {}
 
-    result = Pass2bResult(
+    result = RenderResult(
         rendered=[],
         render_version=RENDER_VERSION,
         source_video_sha256=source_sha,
         source_transcript_sha256=transcript_sha256,
         source_shaped_prompt_version=shaped.prompt_version,
-        source_pass1_prompt_version=shaped.source_pass1_prompt_version,
+        source_score_prompt_version=shaped.source_score_prompt_version,
     )
 
     for sc in shaped.shaped:
@@ -185,7 +183,7 @@ def _prior_manifest_for_skip(manifest_path: Path) -> dict[int, RenderedClip]:
         return {}
     try:
         data = json.loads(manifest_path.read_text())
-        prior = Pass2bResult.model_validate(data)
+        prior = RenderResult.model_validate(data)
     except Exception as e:  # noqa: BLE001
         log.warning("could not load prior manifest %s: %s", manifest_path, e)
         return {}
@@ -289,7 +287,13 @@ def _measure_loudness(
         ),
         "-f", "null", "-",
     ]
-    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"ffmpeg loudnorm-measure exited {e.returncode}: "
+            f"{(e.stderr or '')[:400]}"
+        ) from e
     # ffmpeg writes loudnorm's JSON to stderr.
     blocks = _LOUDNORM_JSON.findall(proc.stderr)
     if not blocks:
@@ -641,7 +645,15 @@ def _probe_video_dims(source: Path, ffprobe_bin: str) -> tuple[int, int]:
         "-of", "csv=p=0:s=x",
         str(source),
     ]
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout.strip()
+    try:
+        out = subprocess.run(
+            cmd, check=True, capture_output=True, text=True
+        ).stdout.strip()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"ffprobe probe-dims exited {e.returncode}: "
+            f"{(e.stderr or '')[:400]}"
+        ) from e
     w_str, h_str = out.split("x")
     return int(w_str), int(h_str)
 
@@ -774,7 +786,14 @@ def _render_ffmpeg(
         "-f", "mp4",
         str(out_path),
     ]
-    subprocess.run(cmd, check=True, capture_output=True)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except subprocess.CalledProcessError as e:
+        stderr_bytes = e.stderr or b""
+        raise RuntimeError(
+            f"ffmpeg render exited {e.returncode}: "
+            f"{stderr_bytes.decode(errors='replace')[:400]}"
+        ) from e
 
 
 def _ffmpeg_escape_path(p: str) -> str:
@@ -816,7 +835,17 @@ def _probe_duration_and_lufs(path: Path, cfg: RenderConfig) -> tuple[float, floa
         "-of", "default=noprint_wrappers=1:nokey=1",
         str(path),
     ]
-    dur = float(subprocess.run(dur_cmd, check=True, capture_output=True, text=True).stdout.strip())
+    try:
+        dur = float(
+            subprocess.run(
+                dur_cmd, check=True, capture_output=True, text=True
+            ).stdout.strip()
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"ffprobe probe-duration exited {e.returncode}: "
+            f"{(e.stderr or '')[:400]}"
+        ) from e
 
     loud_cmd = [
         cfg.ffmpeg_bin,
@@ -831,7 +860,13 @@ def _probe_duration_and_lufs(path: Path, cfg: RenderConfig) -> tuple[float, floa
         ),
         "-f", "null", "-",
     ]
-    proc = subprocess.run(loud_cmd, check=True, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(loud_cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"ffmpeg loudnorm-post exited {e.returncode}: "
+            f"{(e.stderr or '')[:400]}"
+        ) from e
     blocks = _LOUDNORM_JSON.findall(proc.stderr)
     if not blocks:
         raise RuntimeError("post-render loudnorm produced no JSON block")
@@ -864,7 +899,7 @@ def _render_one(
     model_sha: str,
     cfg: RenderConfig,
     fingerprint: str,
-    shaped: Pass2aResult,
+    shaped: ShapeResult,
 ) -> RenderedClip:
     assert sc.trim is not None  # keep-path
 
@@ -953,7 +988,7 @@ def _render_one(
         font_file_sha256=font_sha,
         model_file_sha256=model_sha,
         source_shaped_prompt_version=shaped.prompt_version,
-        source_pass1_prompt_version=shaped.source_pass1_prompt_version,
+        source_score_prompt_version=shaped.source_score_prompt_version,
     )
 
 
@@ -970,7 +1005,7 @@ def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def _write_manifest(result: Pass2bResult, path: Path) -> None:
+def _write_manifest(result: RenderResult, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     try:
@@ -991,17 +1026,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _base_entry(shaped: Pass2aResult) -> dict:
+def _base_entry(shaped: ShapeResult) -> dict:
     return {
         "ts": _now_iso(),
-        "stage": "pass2b",
+        "stage": "render",
         "render_version": RENDER_VERSION,
-        "source_pass1_prompt_version": shaped.source_pass1_prompt_version,
+        "source_score_prompt_version": shaped.source_score_prompt_version,
         "source_shaped_prompt_version": shaped.prompt_version,
     }
 
 
-def _log_entry_rendered(r: RenderedClip, shaped: Pass2aResult) -> dict:
+def _log_entry_rendered(r: RenderedClip, shaped: ShapeResult) -> dict:
     e = _base_entry(shaped)
     e.update({
         "shaped_candidate_index": r.shaped_candidate_index,
@@ -1025,13 +1060,13 @@ def _log_entry_rendered(r: RenderedClip, shaped: Pass2aResult) -> dict:
     return e
 
 
-def _log_entry_fp_skip(r: RenderedClip, shaped: Pass2aResult) -> dict:
+def _log_entry_fp_skip(r: RenderedClip, shaped: ShapeResult) -> dict:
     e = _log_entry_rendered(r, shaped)
     e["skipped_reason"] = "fingerprint_match"
     return e
 
 
-def _log_entry_kill(sc: ShapedClip, shaped: Pass2aResult) -> dict:
+def _log_entry_kill(sc: ShapedClip, shaped: ShapeResult) -> dict:
     e = _base_entry(shaped)
     e.update({
         "shaped_candidate_index": sc.candidate_index,
@@ -1045,7 +1080,7 @@ def _log_entry_kill(sc: ShapedClip, shaped: Pass2aResult) -> dict:
     return e
 
 
-def _log_entry_failed(sc: ShapedClip, shaped: Pass2aResult, err: str) -> dict:
+def _log_entry_failed(sc: ShapedClip, shaped: ShapeResult, err: str) -> dict:
     e = _base_entry(shaped)
     e.update({
         "shaped_candidate_index": sc.candidate_index,

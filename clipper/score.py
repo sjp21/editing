@@ -1,11 +1,11 @@
-"""Pass 1 — Candidate Identification.
+"""Score — Candidate Identification.
 
 For each window, send the transcript + signals summary + frames to Claude
 with the two-stage filter-then-score prompt. Parse, validate, dedupe.
 
 Observability / cost control:
 - System prompt (the rubric) is cached via prompt caching.
-- Usage counters are aggregated into Pass1Result for reproducibility.
+- Usage counters are aggregated into ScoreResult for reproducibility.
 - Every candidate carries model + prompt_version + window_index so the
   feedback loop envisaged in the plan can join labels to runs later.
 """
@@ -26,7 +26,7 @@ import anthropic
 from clipper.schemas import (
     AudioFeature,
     Candidate,
-    Pass1Result,
+    ScoreResult,
     Scores,
     Signals,
     TextFeature,
@@ -44,7 +44,7 @@ MAX_FRAMES_PER_WINDOW = 6
 
 
 @dataclass
-class Pass1Config:
+class ScoreConfig:
     model: str = DEFAULT_MODEL
     # If None, the bundled prompt for PROMPT_VERSION is loaded via
     # importlib.resources so the installed CLI works from any cwd.
@@ -140,17 +140,17 @@ def _select_frames(window: Window, limit: int) -> list:
 # ---------------------------------------------------------------------------
 
 
-def run_pass1(
+def run_score(
     windows: list[Window],
-    cfg: Pass1Config | None = None,
+    cfg: ScoreConfig | None = None,
     client: anthropic.Anthropic | None = None,
-) -> Pass1Result:
-    cfg = cfg or Pass1Config()
+) -> ScoreResult:
+    cfg = cfg or ScoreConfig()
     client = client or anthropic.Anthropic()
 
     rubric = _load_rubric(cfg.prompt_path)
 
-    result = Pass1Result(
+    result = ScoreResult(
         candidates=[],
         model=cfg.model,
         prompt_version=PROMPT_VERSION,
@@ -207,6 +207,8 @@ def run_pass1(
 
     result.candidates = _dedupe_overlaps(result.candidates)
     result.candidates.sort(key=lambda c: c.overall_score, reverse=True)
+    for i, cand in enumerate(result.candidates):
+        cand.score_index = i
     return result
 
 
@@ -214,7 +216,7 @@ def _score_window(
     client: anthropic.Anthropic,
     window: Window,
     rubric: str,
-    cfg: Pass1Config,
+    cfg: ScoreConfig,
 ) -> tuple[list[Candidate], dict, str | None]:
     """Call Claude for a single window. Returns (candidates, usage, filter_reason).
 

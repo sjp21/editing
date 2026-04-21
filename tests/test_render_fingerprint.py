@@ -14,15 +14,15 @@ from clipper.render import (
     _compute_input_fingerprint,
     _prior_manifest_for_skip,
     _should_skip,
-    run_pass2b,
+    run_render,
 )
 from clipper.schemas import (
     CaptionStyle,
     HookTreatment,
-    Pass2aResult,
-    Pass2bResult,
     RenderedClip,
+    RenderResult,
     RenderSettings,
+    ShapeResult,
     ShapedClip,
     ShapedTrim,
     Transcript,
@@ -156,7 +156,7 @@ def test_fingerprint_changes_on_render_version_bump(monkeypatch):
 
 
 def _write_manifest(path: Path, rendered_path: Path, fp: str, out_sha: str) -> None:
-    pr = Pass2bResult(
+    pr = RenderResult(
         rendered=[
             RenderedClip(
                 shaped_candidate_index=0,
@@ -177,14 +177,14 @@ def _write_manifest(path: Path, rendered_path: Path, fp: str, out_sha: str) -> N
                 source_transcript_sha256="t",
                 font_file_sha256="f",
                 source_shaped_prompt_version="v1",
-                source_pass1_prompt_version="v2",
+                source_score_prompt_version="v2",
             )
         ],
         render_version=RENDER_VERSION,
         source_video_sha256="s",
         source_transcript_sha256="t",
         source_shaped_prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
     path.write_text(pr.model_dump_json())
 
@@ -230,17 +230,17 @@ def test_skip_fails_when_output_sha_mismatch(tmp_path):
     assert _should_skip(0, "FP", prior) is None
 
 
-# ---- run_pass2b integration paths without ffmpeg ------------------------------
+# ---- run_render integration paths without ffmpeg ------------------------------
 
 
-def test_run_pass2b_skips_kills_without_invoking_render(tmp_path, monkeypatch):
+def test_run_render_skips_kills_without_invoking_render(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"fake video bytes")
-    shaped = Pass2aResult(
+    shaped = ShapeResult(
         shaped=[_shaped_kill(0), _shaped_kill(1)],
         model="m",
         prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
 
     # Force _render_one to blow up if called.
@@ -253,7 +253,7 @@ def test_run_pass2b_skips_kills_without_invoking_render(tmp_path, monkeypatch):
         log_path=tmp_path / "log.jsonl",
         skip_existing=False,
     )
-    result = run_pass2b(shaped, _transcript(), "T_SHA", video, cfg=cfg)
+    result = run_render(shaped, _transcript(), "T_SHA", video, cfg=cfg)
     assert result.renders_skipped_kill == 2
     assert result.renders_completed == 0
     log_lines = (tmp_path / "log.jsonl").read_text().splitlines()
@@ -263,7 +263,7 @@ def test_run_pass2b_skips_kills_without_invoking_render(tmp_path, monkeypatch):
         assert entry["skipped_reason"] == "kill"
 
 
-def test_run_pass2b_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
+def test_run_render_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"fake video bytes")
     out_dir = tmp_path / "clips"
@@ -271,11 +271,11 @@ def test_run_pass2b_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
     mp4 = out_dir / "clip-0.mp4"
     mp4.write_bytes(b"fake mp4 output")
 
-    shaped = Pass2aResult(
+    shaped = ShapeResult(
         shaped=[_shaped_keep(0)],
         model="m",
         prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
     # Freeze font + model resolution so the fingerprint is predictable.
     monkeypatch.setattr(rmod, "_resolve_font", lambda style, cache_dir: (tmp_path / "font.ttf", "FONT_SHA"))
@@ -300,14 +300,14 @@ def test_run_pass2b_fingerprint_skip_bypasses_render(tmp_path, monkeypatch):
     monkeypatch.setattr(rmod, "_render_one", _boom)
 
     cfg = RenderConfig(out_dir=out_dir, log_path=tmp_path / "log.jsonl", skip_existing=True)
-    result = run_pass2b(shaped, _transcript(), "T_SHA", video, cfg=cfg)
+    result = run_render(shaped, _transcript(), "T_SHA", video, cfg=cfg)
     assert result.renders_skipped_fingerprint == 1
     assert result.renders_completed == 0
     entry = json.loads((tmp_path / "log.jsonl").read_text().splitlines()[0])
     assert entry["skipped_reason"] == "fingerprint_match"
 
 
-def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
+def test_run_render_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
     video = tmp_path / "video.mp4"
     video.write_bytes(b"fake video")
     out_dir = tmp_path / "clips"
@@ -315,11 +315,11 @@ def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
     mp4 = out_dir / "clip-0.mp4"
     mp4.write_bytes(b"fake")
 
-    shaped = Pass2aResult(
+    shaped = ShapeResult(
         shaped=[_shaped_keep(0)],
         model="m",
         prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
     monkeypatch.setattr(rmod, "_resolve_font", lambda style, cache_dir: (tmp_path / "font.ttf", "FONT_SHA"))
     monkeypatch.setattr(rmod, "_resolve_face_model", lambda cache_dir: (tmp_path / "model.tflite", "MODEL_SHA"))
@@ -356,13 +356,13 @@ def test_run_pass2b_fingerprint_mismatch_forces_render(tmp_path, monkeypatch):
             font_file_sha256=font_sha,
             model_file_sha256=model_sha,
             source_shaped_prompt_version=shaped_arg.prompt_version,
-            source_pass1_prompt_version=shaped_arg.source_pass1_prompt_version,
+            source_score_prompt_version=shaped_arg.source_score_prompt_version,
         )
 
     monkeypatch.setattr(rmod, "_render_one", _fake_render)
 
     cfg = RenderConfig(out_dir=out_dir, log_path=tmp_path / "log.jsonl", skip_existing=True)
-    result = run_pass2b(shaped, _transcript(), "T_SHA", video, cfg=cfg)
+    result = run_render(shaped, _transcript(), "T_SHA", video, cfg=cfg)
     assert render_called["n"] == 1
     assert result.renders_completed == 1
     assert result.renders_skipped_fingerprint == 0

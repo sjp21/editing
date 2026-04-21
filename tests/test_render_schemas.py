@@ -1,4 +1,4 @@
-"""Pass 2b schema round-trip and invariant tests."""
+"""Render schema round-trip and invariant tests."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from clipper.schemas import (
     CaptionStyle,
-    Pass2bResult,
+    RenderResult,
     RenderSettings,
     RenderedClip,
 )
@@ -38,7 +38,7 @@ def _rendered(**overrides) -> RenderedClip:
         font_file_sha256="4" * 64,
         model_file_sha256="3" * 64,
         source_shaped_prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
     kwargs.update(overrides)
     return RenderedClip(**kwargs)
@@ -64,21 +64,21 @@ def test_face_coverage_bounds():
         _rendered(face_coverage=1.01)
 
 
-def test_pass2b_result_roundtrip():
-    p = Pass2bResult(
+def test_render_result_roundtrip():
+    p = RenderResult(
         rendered=[_rendered()],
         render_version="v1",
         source_video_sha256="9" * 64,
         source_transcript_sha256="7" * 64,
         source_shaped_prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
         renders_completed=1,
         renders_skipped_kill=2,
         renders_skipped_fingerprint=3,
         renders_failed=4,
     )
     data = p.model_dump_json()
-    back = Pass2bResult.model_validate_json(data)
+    back = RenderResult.model_validate_json(data)
     assert back.renders_completed == 1
     assert back.renders_skipped_kill == 2
     assert back.renders_skipped_fingerprint == 3

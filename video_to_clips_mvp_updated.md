@@ -1,24 +1,30 @@
 # Project: Video-to-Clips Pipeline (MVP)
 
+*Historical artifact — the original MVP spec.* The stage named here as
+"Pass 1" is now called **score** (module `clipper/score.py`). Filename
+preserved because older PRs and conversations reference this document; body
+rewritten against the current names. See [plan.md](plan.md) for the rename.
+
 ## Objective
-Build a CLI tool that takes a 0–30 minute video and outputs ranked candidate 15–20 second clips optimized for short-form platforms (TikTok, Reels, Shorts).
+Build a CLI tool that takes a 0–30 minute video and outputs ranked candidate
+15–20 second clips optimized for short-form platforms (TikTok, Reels, Shorts).
 
 The system uses:
 - Whisper (via faster-whisper) for transcript generation
 - ffmpeg for frame extraction
 - Claude for editorial judgment (selection + scoring)
 
-**Scope: Pass 1 only (Candidate Identification).**
+**Scope: score stage only (Candidate Identification).**
 
 ---
 
 # Architecture
 
 ## High-Level Design
-Two-pass system (only Pass 1 implemented in MVP):
+Two-pass system (only the score stage implemented in MVP):
 
-- Pass 1 — Candidate Identification
-- Pass 2 — Clip Crafting (deferred)
+- Score — Candidate Identification
+- Pass 2 — Clip Crafting (deferred; later built out as shape + render)
 
 ---
 
@@ -86,7 +92,7 @@ Each window includes:
 
 ---
 
-# Pass 1 — Candidate Identification
+# Score — Candidate Identification
 
 ## Two-Stage Reasoning
 
@@ -170,7 +176,7 @@ clipper/
   ingest.py
   signals.py      # NEW: energy + audio feature extraction
   windows.py
-  pass1.py
+  score.py
   schemas.py
   cli.py
   prompts/v1/
@@ -197,7 +203,7 @@ clipper/
 3. Build signals.py (energy + audio features)
 4. Implement windowing
 5. Write prompt
-6. Build pass1 + CLI
+6. Build score + CLI
 7. Run end-to-end
 
 ---

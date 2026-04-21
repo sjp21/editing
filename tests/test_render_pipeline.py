@@ -15,12 +15,12 @@ from pathlib import Path
 
 import pytest
 
-from clipper.render import RenderConfig, run_pass2b
+from clipper.render import RenderConfig, run_render
 from clipper.schemas import (
     CaptionStyle,
     HookTreatment,
-    Pass2aResult,
     RenderSettings,
+    ShapeResult,
     ShapedClip,
     ShapedTrim,
     Transcript,
@@ -70,7 +70,7 @@ def _make_transcript(seconds: float) -> Transcript:
     return Transcript(language="en", duration=seconds, segments=[seg])
 
 
-def _shaped(trim_start=0.5, trim_end=13.5) -> Pass2aResult:
+def _shaped(trim_start=0.5, trim_end=13.5) -> ShapeResult:
     # 13.0s is outside ShapedTrim's [12, 22] range; use 13 exactly to stay valid.
     duration = round(trim_end - trim_start, 2)
     trim = ShapedTrim(
@@ -78,7 +78,7 @@ def _shaped(trim_start=0.5, trim_end=13.5) -> Pass2aResult:
         start_word="most", end_word="three",
         duration_seconds=duration,
     )
-    return Pass2aResult(
+    return ShapeResult(
         shaped=[
             ShapedClip(
                 candidate_index=0,
@@ -106,7 +106,7 @@ def _shaped(trim_start=0.5, trim_end=13.5) -> Pass2aResult:
         ],
         model="m",
         prompt_version="v1",
-        source_pass1_prompt_version="v2",
+        source_score_prompt_version="v2",
     )
 
 
@@ -119,15 +119,15 @@ def test_end_to_end_render(tmp_path):
     tr_path.write_text(transcript.model_dump_json())
     tr_sha = _sha256_file(tr_path)
 
-    pass2a = _shaped(trim_start=0.5, trim_end=13.5)
+    shaped = _shaped(trim_start=0.5, trim_end=13.5)
 
     cfg = RenderConfig(
         out_dir=tmp_path / "clips",
-        log_path=tmp_path / "pass2b.jsonl",
+        log_path=tmp_path / "render.jsonl",
         skip_existing=True,
     )
 
-    result = run_pass2b(pass2a, transcript, tr_sha, video, cfg=cfg)
+    result = run_render(shaped, transcript, tr_sha, video, cfg=cfg)
     assert result.renders_completed == 1
     assert result.renders_skipped_kill == 1
     assert result.renders_failed == 0
@@ -169,13 +169,13 @@ def test_rerun_hits_fingerprint_skip(tmp_path):
     tr_path = tmp_path / "tr.json"
     tr_path.write_text(transcript.model_dump_json())
     tr_sha = _sha256_file(tr_path)
-    pass2a = _shaped(trim_start=0.5, trim_end=13.5)
+    shaped = _shaped(trim_start=0.5, trim_end=13.5)
 
     cfg = RenderConfig(out_dir=tmp_path / "clips", log_path=tmp_path / "log.jsonl")
-    r1 = run_pass2b(pass2a, transcript, tr_sha, video, cfg=cfg)
+    r1 = run_render(shaped, transcript, tr_sha, video, cfg=cfg)
     sha1 = r1.rendered[0].output_sha256
 
-    r2 = run_pass2b(pass2a, transcript, tr_sha, video, cfg=cfg)
+    r2 = run_render(shaped, transcript, tr_sha, video, cfg=cfg)
     assert r2.renders_skipped_fingerprint == 1
     assert r2.renders_completed == 0
     # Same sha — fingerprint skip returned the prior record.
@@ -191,7 +191,7 @@ def test_failed_render_leaves_no_partial(tmp_path, monkeypatch):
     tr_sha = _sha256_file(tr_path)
 
     # Shape a clip whose trim is inside the fixture.
-    pass2a = _shaped(trim_start=0.5, trim_end=13.0)  # end past fixture duration
+    shaped = _shaped(trim_start=0.5, trim_end=13.0)  # end past fixture duration
     cfg = RenderConfig(out_dir=tmp_path / "clips", log_path=tmp_path / "log.jsonl")
 
     # Force _render_ffmpeg to fail mid-way by substituting the binary.
@@ -205,7 +205,7 @@ def test_failed_render_leaves_no_partial(tmp_path, monkeypatch):
         raise RuntimeError("synthetic mid-render failure")
     monkeypatch.setattr(rmod, "_render_ffmpeg", _fail)
 
-    result = run_pass2b(pass2a, transcript, tr_sha, video, cfg=cfg)
+    result = run_render(shaped, transcript, tr_sha, video, cfg=cfg)
     assert result.renders_failed == 1
 
     mp4 = tmp_path / "clips" / "clip-0.mp4"

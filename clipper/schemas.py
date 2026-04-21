@@ -89,7 +89,7 @@ class Frame(BaseModel):
 
 
 class Window(BaseModel):
-    """A candidate region handed to Pass 1."""
+    """A candidate region handed to the scorer."""
 
     index: int
     start: float
@@ -105,7 +105,7 @@ class Window(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pass 1 output
+# Score output
 # ---------------------------------------------------------------------------
 
 
@@ -132,6 +132,12 @@ class Candidate(BaseModel):
     window_index: int | None = None
     prompt_version: str | None = None
     model: str | None = None
+    # Stable identity assigned after the scorer's dedupe+sort. The ranker
+    # reorders/filters candidates; this field lets downstream stages (and
+    # their JSONL logs) join back to the original scorer identity. Nullable
+    # for back-compat with candidates.json files written before this field
+    # existed.
+    score_index: int | None = None
 
     @field_validator("duration_seconds")
     @classmethod
@@ -175,7 +181,7 @@ class WindowDiagnostic(BaseModel):
     call_succeeded: bool = True
 
 
-class Pass1Result(BaseModel):
+class ScoreResult(BaseModel):
     candidates: list[Candidate]
     # Observability — lets us reproduce and diff runs later.
     model: str
@@ -190,7 +196,7 @@ class Pass1Result(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pass 2a — Shaping output
+# Shape output
 # ---------------------------------------------------------------------------
 
 
@@ -260,11 +266,15 @@ class ShapedClip(BaseModel):
         return self
 
 
-class Pass2aResult(BaseModel):
+class ShapeResult(BaseModel):
     shaped: list[ShapedClip]
     model: str
     prompt_version: str
-    source_pass1_prompt_version: str
+    source_score_prompt_version: str
+    # Set when shape's input was filtered by the ranker. None when shape
+    # consumes a raw ScoreResult. Lets JSONL rows join back to the ranker call.
+    source_ranker_prompt_version: str | None = None
+    profile: str | None = None
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     cache_read_tokens: int = 0
@@ -275,7 +285,7 @@ class Pass2aResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Pass 2b — Rendering
+# Render output
 # ---------------------------------------------------------------------------
 
 
@@ -328,17 +338,144 @@ class RenderedClip(BaseModel):
     font_file_sha256: str
     model_file_sha256: str = ""
     source_shaped_prompt_version: str
-    source_pass1_prompt_version: str
+    source_score_prompt_version: str
 
 
-class Pass2bResult(BaseModel):
+class RenderResult(BaseModel):
     rendered: list[RenderedClip]
     render_version: str
     source_video_sha256: str
     source_transcript_sha256: str
     source_shaped_prompt_version: str
-    source_pass1_prompt_version: str
+    source_score_prompt_version: str
     renders_completed: int = 0
     renders_skipped_kill: int = 0
     renders_skipped_fingerprint: int = 0
     renders_failed: int = 0
+
+
+# ---------------------------------------------------------------------------
+# Posted output (manual feedback-loop entry)
+# ---------------------------------------------------------------------------
+
+
+class PostedClip(BaseModel):
+    ts: str
+    stage: Literal["post"] = "post"
+    # Join key back to ShapedClip.candidate_index / RenderedClip.shaped_candidate_index.
+    shaped_candidate_index: int
+    video_stem: str
+    source_video_sha256: str
+    output_path: str
+    output_sha256: str
+    render_version: str
+    source_shaped_prompt_version: str
+    source_score_prompt_version: str
+    platform: str
+    post_id: str
+    post_url: str | None = None
+    title: str | None = None
+    posted_at: str | None = None
+    notes: str | None = None
+
+    @field_validator("platform", "post_id")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("must be non-empty")
+        return v
+
+
+# ---------------------------------------------------------------------------
+# Global ranker output
+# ---------------------------------------------------------------------------
+
+
+class RankedClip(BaseModel):
+    candidate_index: int  # points at Candidate.score_index
+    rank: int = Field(ge=1)
+    hook_quote: str
+    payoff_in_window: bool
+    payoff_reason: str
+    comparative_reason: str
+    profile_conflict_note: str | None = None
+
+
+class DroppedClip(BaseModel):
+    candidate_index: int
+    reason_kind: Literal[
+        "semantic_duplicate",
+        "weak_hook",
+        "payoff_absent",
+        "generic",
+        "two_ideas",
+        "opens_on_conjunction",
+        "other",
+    ]
+    reason_detail: str
+    comparative_reason: str
+    duplicate_of_candidate_index: int | None = None
+    hook_quote: str | None = None
+
+
+class RankedCandidates(BaseModel):
+    ranked: list[RankedClip]
+    dropped: list[DroppedClip]
+    requested_k: int = Field(ge=1)
+    truncation_note: str | None = None
+    profile: str | None = None
+    profile_version: str | None = None
+    model: str
+    prompt_version: str
+    source_score_prompt_version: str
+    call_id: str
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+    @model_validator(mode="after")
+    def _validate_ranking(self) -> "RankedCandidates":
+        if len(self.ranked) > self.requested_k:
+            raise ValueError(
+                f"ranked count ({len(self.ranked)}) exceeds requested_k ({self.requested_k})"
+            )
+
+        ranks = sorted(c.rank for c in self.ranked)
+        if ranks != list(range(1, len(self.ranked) + 1)):
+            raise ValueError(
+                f"ranks must be 1..N contiguous with no duplicates, got {ranks}"
+            )
+
+        ranked_ids = {c.candidate_index for c in self.ranked}
+        dropped_ids = {c.candidate_index for c in self.dropped}
+        if len(ranked_ids) != len(self.ranked):
+            raise ValueError("duplicate candidate_index within ranked")
+        if len(dropped_ids) != len(self.dropped):
+            raise ValueError("duplicate candidate_index within dropped")
+        if ranked_ids & dropped_ids:
+            raise ValueError(
+                f"candidate appears in both ranked and dropped: "
+                f"{sorted(ranked_ids & dropped_ids)}"
+            )
+
+        truncated = len(self.ranked) < self.requested_k
+        if truncated and not (self.truncation_note and self.truncation_note.strip()):
+            raise ValueError(
+                "truncation_note required when len(ranked) < requested_k"
+            )
+        if not truncated and self.truncation_note:
+            raise ValueError(
+                "truncation_note must be absent when len(ranked) == requested_k"
+            )
+
+        for d in self.dropped:
+            if d.duplicate_of_candidate_index is None:
+                continue
+            if d.duplicate_of_candidate_index not in ranked_ids:
+                raise ValueError(
+                    f"dropped candidate {d.candidate_index} references "
+                    f"duplicate_of_candidate_index={d.duplicate_of_candidate_index} "
+                    f"which is not in ranked"
+                )
+        return self

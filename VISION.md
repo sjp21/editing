@@ -22,26 +22,26 @@ Turn long-form video into short-form social content that actually performs. The 
 3. Produce finished, platform-ready clips from those moments.
 4. Learn from real-world performance and improve over time.
 
-Pillars 1 and 2 are partially built (Pass 1). Pillars 3 and 4 are the work ahead.
+Pillars 1 and 2 are partially built (score). Pillars 3 and 4 are the work ahead.
 
 ## Architectural principle: extend by seams
 
-The project has a clean typed JSON seam at `Pass1Result`. Every future stage follows the same discipline: a typed JSON boundary between stages, so any stage can be swapped, upgraded, or replaced without touching the others. This is the single most important structural rule. Do not collapse stages for convenience; do not let Pass 2 logic leak into Pass 1; do not bypass the seams to save a call.
+The project has a clean typed JSON seam at `ScoreResult`. Every future stage follows the same discipline: a typed JSON boundary between stages, so any stage can be swapped, upgraded, or replaced without touching the others. This is the single most important structural rule. Do not collapse stages for convenience; do not let shape/render logic leak into score; do not bypass the seams to save a call.
 
 If a change would erase or muddy a stage boundary, that is a signal to stop and reconsider.
 
 ## Stage map
 
-### Pass 1 — Candidate identification (built)
-Finds 15–20s candidate segments. Output: `Pass1Result`. Do not extend this stage with cropping, captioning, ranking, or shaping logic.
+### Score — Candidate identification (built)
+Finds 15–20s candidate segments. Output: `ScoreResult`. Do not extend this stage with cropping, captioning, ranking, or shaping logic.
 
 ### Global ranker (next conceptual stage)
-Pass 1's deduplication is per-window and cannot catch semantic near-duplicates (e.g., the same story told twice) or rank across the whole video. A single Claude call that sees all candidates at once returns a ranked top-K with per-clip justifications and a diversity constraint. Output: `RankedCandidates`. This is the stage that makes "best moments" mean best, not merely "passed threshold."
+The scorer's deduplication is per-window and cannot catch semantic near-duplicates (e.g., the same story told twice) or rank across the whole video. A single Claude call that sees all candidates at once returns a ranked top-K with per-clip justifications and a diversity constraint. Output: `RankedCandidates`. This is the stage that makes "best moments" mean best, not merely "passed threshold."
 
-### Pass 2a — Shaping (reasoning)
+### Shape (reasoning)
 Per-candidate Claude call with transcript ±30s of context and word-level timestamps. Returns an exact trim (to the word), a hook rewrite or overlay suggestion, and a keep/kill verdict. Output: `ShapedClip`. Pure reasoning — cacheable and testable in isolation.
 
-### Pass 2b — Rendering (deterministic)
+### Render (deterministic)
 A deterministic pipeline that takes a `ShapedClip` and produces a finished, platform-ready file. It must:
 
 - **Reframe to 9:16** using a face/subject tracker with a smoothed crop window. Multi-subject scenes may need a more capable segmenter.
@@ -78,9 +78,9 @@ Given those constraints, the approach is:
 
 Each step is independently valuable and preserves the seams:
 
-1. Pass 2b rendering (crop + captions + loudness) — unlocks shipping anything at all.
+1. Render (crop + captions + loudness) — unlocks shipping anything at all.
 2. Global ranker — makes selection meaningful.
-3. Pass 2a shaping — sharpens trims and hooks.
+3. Shape — sharpens trims and hooks.
 4. Platform profiles — externalizes taste.
 5. Logging infrastructure and manual outcome entry — starts the flywheel.
 6. Platform API integrations — automates outcome capture.
@@ -93,5 +93,6 @@ Each step is independently valuable and preserves the seams:
 - Training custom models from scratch.
 - Multi-speaker diarization-driven reframing beyond what a tracker with smoothing handles.
 - Generating B-roll, music, or synthetic voiceover.
+- Music-synced editing (cutting long performance/pose footage to a chosen music track, for bands or fashion-style creators). Achievable with beat detection + visual motion energy, but a distinct product with different users and quality bars — a plausible v2 direction, deliberately out of scope until the speech pipeline has closed its feedback loop.
 
 These may become in-scope later, but sub-tasks should not quietly pull them in.

@@ -7,17 +7,25 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 from dotenv import load_dotenv
 
+from clipper._posted import append_posted, resolve_identity
 from clipper.frames import extract_frames
 from clipper.ingest import IngestConfig, extract_audio, transcribe
-from clipper.pass1 import DEFAULT_MODEL, Pass1Config, run_pass1
-from clipper.pass2a import Pass2aConfig, run_pass2a
-from clipper.render import RenderConfig, run_pass2b
-from clipper.schemas import Pass1Result, Pass2aResult, Transcript
+from clipper.score import DEFAULT_MODEL, ScoreConfig, run_score
+from clipper.shape import ShapeConfig, run_shape
+from clipper.ranker import (
+    DEFAULT_K as RANKER_DEFAULT_K,
+    RankerConfig,
+    apply_ranking,
+    run_ranker,
+)
+from clipper.render import RenderConfig, run_render
+from clipper.schemas import PostedClip, RankedCandidates, ScoreResult, ShapeResult, Transcript
 from clipper.signals import compute_signals
 from clipper.windows import WindowConfig, build_windows
 
@@ -29,8 +37,13 @@ app = typer.Typer(add_completion=False, no_args_is_help=True)
 @app.command()
 def process(
     video: Path = typer.Argument(..., exists=True, readable=True, help="Input video file"),
+    output_dir: Path = typer.Option(
+        None, "--output-dir", "-O",
+        help="Per-video output root (default: outputs/<video-stem>)",
+    ),
     out: Path = typer.Option(
-        Path("outputs/json/candidates.json"), "--out", "-o", help="Output JSON"
+        None, "--out", "-o",
+        help="Pass 1 output JSON (default: <output-dir>/candidates.json)",
     ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", help="Claude model id"),
     whisper_model: str = typer.Option("small", "--whisper", help="faster-whisper model size"),
@@ -43,30 +56,52 @@ def process(
     max_windows: int | None = typer.Option(
         None, "--max-windows", help="Process only the first N windows (dev)"
     ),
-    shape: bool = typer.Option(False, "--shape/--no-shape", help="Also run Pass 2a shaping"),
+    rank: bool = typer.Option(
+        False, "--rank/--no-rank",
+        help="Also run the global ranker between score and shape",
+    ),
+    k: int = typer.Option(
+        RANKER_DEFAULT_K, "--k",
+        help="Ranker top-K ceiling (may truncate lower when clips don't clear the bar)",
+    ),
+    profile: str | None = typer.Option(
+        None, "--profile", help="Platform profile name for the ranker (optional)"
+    ),
+    shape: bool = typer.Option(False, "--shape/--no-shape", help="Also run shape stage"),
     shape_out: Path = typer.Option(
-        Path("outputs/json/shaped.json"), "--shape-out",
-        help="Pass 2a output JSON (when --shape)",
+        None, "--shape-out",
+        help="Shape output JSON (default: <output-dir>/shaped.json)",
     ),
     render: bool = typer.Option(
-        False, "--render/--no-render", help="Also run Pass 2b rendering (requires --shape)"
+        False, "--render/--no-render", help="Also run render stage (requires --shape)"
     ),
     render_dir: Path = typer.Option(
-        Path("outputs/mp4"), "--render-dir",
-        help="Output directory for rendered MP4s (when --render)",
+        None, "--render-dir",
+        help="Output directory for rendered MP4s (default: <output-dir>/clips)",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Process a video into ranked candidate clips via Pass 1."""
+    """Process a video into ranked candidate clips via the scorer."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("clipper.cli")
 
-    # Fail fast before the pipeline — Pass 1 runs a paid Claude call per window.
+    # Fail fast before the pipeline — the scorer runs a paid Claude call per window.
     if render and not shape:
         raise typer.BadParameter("--render requires --shape")
+    if render and not rank:
+        log.warning(
+            "rendering un-ranked candidates — you may burn GPU on clips the "
+            "ranker would drop. Pass --rank to filter first."
+        )
+
+    root = output_dir or Path("outputs") / video.stem
+    out = out or root / "candidates.json"
+    shape_out = shape_out or root / "shaped.json"
+    render_dir = render_dir or root / "clips"
+    log_dir = root / "logs"
 
     ingest_cfg = IngestConfig(
         whisper_model=whisper_model,
@@ -102,16 +137,15 @@ def process(
         windows = windows[:max_windows]
         log.info("limited to first %d windows", len(windows))
 
-    log.info("5/5 running Pass 1 on %d windows (model=%s)", len(windows), model)
-    pass1_cfg = Pass1Config(
+    log.info("5/5 running score on %d windows (model=%s)", len(windows), model)
+    score_cfg = ScoreConfig(
         model=model,
         frames_per_window=frames_per_window,
         effort=effort,
     )
-    result = run_pass1(windows, cfg=pass1_cfg)
+    result = run_score(windows, cfg=score_cfg)
 
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(result.model_dump_json(indent=2))
+    _atomic_write_json(out, result)
     log.info(
         "wrote %s — %d candidates (%d windows processed, %d rejected)",
         out,
@@ -129,14 +163,51 @@ def process(
 
     _print_summary(result, top_k=10)
 
+    shape_input = result
+    ranker_prompt_version: str | None = None
+    if rank:
+        log.info(
+            "running ranker on %d candidates (k=%d, profile=%s)",
+            len(result.candidates),
+            k,
+            profile,
+        )
+        ranker_cfg = RankerConfig(
+            model=model,
+            effort=effort,
+            k=k,
+            profile=profile,
+            log_path=log_dir / "ranker.jsonl",
+        )
+        ranked = run_ranker(result, cfg=ranker_cfg)
+        _atomic_write_json(root / "ranking_decisions.json", ranked)
+        shape_input = apply_ranking(result, ranked)
+        _atomic_write_json(root / "ranked.json", shape_input)
+        ranker_prompt_version = ranked.prompt_version
+        log.info(
+            "ranker kept %d of %d candidates%s",
+            len(shape_input.candidates),
+            len(result.candidates),
+            f" (truncated: {ranked.truncation_note})" if ranked.truncation_note else "",
+        )
+
     if shape:
-        log.info("running Pass 2a on %d candidates", len(result.candidates))
-        shaped = run_pass2a(result, transcript, cfg=Pass2aConfig(model=model, effort=effort))
-        shape_out.parent.mkdir(parents=True, exist_ok=True)
-        shape_out.write_text(shaped.model_dump_json(indent=2))
+        log.info("running shape on %d candidates", len(shape_input.candidates))
+        shaped = run_shape(
+            shape_input,
+            transcript,
+            cfg=ShapeConfig(
+                model=model,
+                effort=effort,
+                profile=profile,
+                log_path=log_dir / "shape.jsonl",
+            ),
+            source_ranker_prompt_version=ranker_prompt_version,
+        )
+        _atomic_write_json(shape_out, shaped)
         # Persist the transcript sidecar so a standalone `render` call consumes
-        # bit-identical word timings. Downstream Pass 2b hashes this file.
-        transcript_sidecar = _write_transcript_sidecar(shape_out, transcript)
+        # bit-identical word timings. Downstream render hashes this file.
+        transcript_sidecar = _write_transcript_sidecar(root, transcript)
         log.info(
             "wrote %s — %d shaped, %d killed, %d failed",
             shape_out,
@@ -146,18 +217,21 @@ def process(
         )
 
         if render:
-            log.info("running Pass 2b rendering into %s", render_dir)
+            log.info("running render into %s", render_dir)
             transcript_sha = _sha256_file(transcript_sidecar)
-            pass2b = run_pass2b(
+            rendered = run_render(
                 shaped, transcript, transcript_sha, video,
-                cfg=RenderConfig(out_dir=render_dir),
+                cfg=RenderConfig(
+                    out_dir=render_dir,
+                    log_path=log_dir / "render.jsonl",
+                ),
             )
             log.info(
                 "rendered %d, skipped_kill=%d, skipped_fp=%d, failed=%d",
-                pass2b.renders_completed,
-                pass2b.renders_skipped_kill,
-                pass2b.renders_skipped_fingerprint,
-                pass2b.renders_failed,
+                rendered.renders_completed,
+                rendered.renders_skipped_kill,
+                rendered.renders_skipped_fingerprint,
+                rendered.renders_failed,
             )
 
 
@@ -166,27 +240,59 @@ def shape(
     video: Path = typer.Argument(..., exists=True, readable=True, help="Input video file"),
     candidates: Path = typer.Option(
         ..., "--candidates", "-c", exists=True, readable=True,
-        help="Pass1Result JSON from a previous `process` run",
+        help="ScoreResult JSON from a previous `process` run",
+    ),
+    output_dir: Path = typer.Option(
+        None, "--output-dir", "-O",
+        help="Per-video output root (default: outputs/<video-stem>)",
     ),
     out: Path = typer.Option(
-        Path("outputs/json/shaped.json"), "--out", "-o", help="Output JSON"
+        None, "--out", "-o",
+        help="Output JSON (default: <output-dir>/shaped.json)",
     ),
     model: str = typer.Option(DEFAULT_MODEL, "--model", help="Claude model id"),
     whisper_model: str = typer.Option("small", "--whisper", help="faster-whisper model size"),
     whisper_device: str = typer.Option("auto", "--device", help="cpu | cuda | auto"),
     cache_dir: Path = typer.Option(Path(".cache"), "--cache", help="Cache directory"),
     effort: str = typer.Option("high", "--effort", help="low | medium | high | max"),
+    profile: str | None = typer.Option(
+        None, "--profile", help="Platform profile name for the shaper (optional)"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run Pass 2a shaping on a saved Pass 1 result."""
+    """Run shape on a saved score result."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("clipper.cli")
 
-    pass1 = Pass1Result.model_validate_json(candidates.read_text())
-    log.info("loaded %d candidates from %s", len(pass1.candidates), candidates)
+    root = output_dir or Path("outputs") / video.stem
+    out = out or root / "shaped.json"
+    log_dir = root / "logs"
+
+    scored = ScoreResult.model_validate_json(candidates.read_text())
+    log.info("loaded %d candidates from %s", len(scored.candidates), candidates)
+
+    # If the user just ran `clipper rank` in the same directory, the sibling
+    # ranking_decisions.json carries the prompt_version of the ranker call
+    # that produced these survivors. Forward it so shape's shaped.json and
+    # its jsonl rows can be joined back to that ranker call at retro time.
+    ranker_prompt_version: str | None = None
+    decisions_path = candidates.parent / "ranking_decisions.json"
+    if decisions_path.is_file():
+        try:
+            decisions = RankedCandidates.model_validate_json(
+                decisions_path.read_text()
+            )
+            ranker_prompt_version = decisions.prompt_version
+            log.info(
+                "joined ranker provenance from %s (prompt_version=%s)",
+                decisions_path,
+                ranker_prompt_version,
+            )
+        except Exception as e:
+            log.warning("ignoring unreadable %s: %s", decisions_path, e)
 
     ingest_cfg = IngestConfig(
         whisper_model=whisper_model,
@@ -196,10 +302,19 @@ def shape(
     audio = extract_audio(video, cache_dir)
     transcript = transcribe(audio, ingest_cfg)
 
-    shaped = run_pass2a(pass1, transcript, cfg=Pass2aConfig(model=model, effort=effort))
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(shaped.model_dump_json(indent=2))
-    sidecar = _write_transcript_sidecar(out, transcript)
+    shaped = run_shape(
+        scored,
+        transcript,
+        cfg=ShapeConfig(
+            model=model,
+            effort=effort,
+            profile=profile,
+            log_path=log_dir / "shape.jsonl",
+        ),
+        source_ranker_prompt_version=ranker_prompt_version,
+    )
+    _atomic_write_json(out, shaped)
+    sidecar = _write_transcript_sidecar(root, transcript)
     log.info(
         "wrote %s (+ %s) — %d shaped, %d killed, %d failed",
         out,
@@ -218,18 +333,92 @@ def shape(
 
 
 @app.command()
+def rank(
+    candidates: Path = typer.Option(
+        ..., "--candidates", "-c", exists=True, readable=True,
+        help="ScoreResult JSON from a previous `process` run",
+    ),
+    output_dir: Path = typer.Option(
+        None, "--output-dir", "-O",
+        help="Per-video output root (default: <candidates-parent>)",
+    ),
+    k: int = typer.Option(
+        RANKER_DEFAULT_K, "--k",
+        help="Ranker top-K ceiling (may truncate lower when clips don't clear the bar)",
+    ),
+    profile: str | None = typer.Option(
+        None, "--profile", help="Platform profile name (optional)"
+    ),
+    model: str = typer.Option(DEFAULT_MODEL, "--model", help="Claude model id"),
+    effort: str = typer.Option("high", "--effort", help="low | medium | high | max"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Run the global ranker on a saved score result."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("clipper.cli")
+
+    scored = ScoreResult.model_validate_json(candidates.read_text())
+    if any(c.score_index is None for c in scored.candidates):
+        raise typer.BadParameter(
+            f"{candidates} was written before score_index was populated. "
+            "Re-run `clipper process` to regenerate candidates.json."
+        )
+
+    root = output_dir or candidates.parent
+    log_dir = root / "logs"
+
+    log.info(
+        "ranking %d candidates (k=%d, profile=%s)",
+        len(scored.candidates),
+        k,
+        profile,
+    )
+    ranker_cfg = RankerConfig(
+        model=model,
+        effort=effort,
+        k=k,
+        profile=profile,
+        log_path=log_dir / "ranker.jsonl",
+    )
+    ranked = run_ranker(scored, cfg=ranker_cfg)
+
+    survivors = apply_ranking(scored, ranked)
+    _atomic_write_json(root / "ranking_decisions.json", ranked)
+    _atomic_write_json(root / "ranked.json", survivors)
+    log.info(
+        "wrote %s and %s — kept %d of %d%s",
+        root / "ranking_decisions.json",
+        root / "ranked.json",
+        len(survivors.candidates),
+        len(scored.candidates),
+        f" (truncated: {ranked.truncation_note})" if ranked.truncation_note else "",
+    )
+    log.info(
+        "tokens: in=%d out=%d cache_read=%d cache_write=%d",
+        ranked.total_input_tokens,
+        ranked.total_output_tokens,
+        ranked.cache_read_tokens,
+        ranked.cache_creation_tokens,
+    )
+
+
+@app.command()
 def render(
     video: Path = typer.Argument(..., exists=True, readable=True, help="Input video file"),
     shaped: Path = typer.Option(
         ..., "--shaped", "-s", exists=True, readable=True,
-        help="Pass2aResult JSON from a previous `shape` run",
+        help="ShapeResult JSON from a previous `shape` run",
     ),
     transcript: Path = typer.Option(
         None, "--transcript", "-t",
-        help="Transcript JSON sidecar (defaults to <shaped>.transcript.json)",
+        help="Transcript JSON sidecar (default: <shaped-parent>/transcript.json)",
     ),
     out_dir: Path = typer.Option(
-        Path("outputs/mp4"), "--out-dir", "-o", help="Output directory for rendered MP4s"
+        None, "--out-dir", "-o",
+        help="Output directory for rendered MP4s (default: <shaped-parent>/clips)",
     ),
     manifest: Path | None = typer.Option(
         None, "--manifest", help="Manifest JSON path (defaults to <out-dir>/rendered.json)"
@@ -239,21 +428,23 @@ def render(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Render Pass 2b clips from a saved Pass 2a result + transcript sidecar."""
+    """Render clips from a saved shape result + transcript sidecar."""
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     log = logging.getLogger("clipper.cli")
 
-    transcript_path = transcript or Path(str(shaped) + ".transcript.json")
+    root = shaped.parent
+    transcript_path = transcript or root / "transcript.json"
     if not transcript_path.exists():
         raise typer.BadParameter(
             f"transcript sidecar not found at {transcript_path}. "
-            f"Run `clipper shape` first — it writes a sidecar next to shaped.json."
+            f"Run `clipper shape` first — it writes transcript.json next to shaped.json."
         )
+    out_dir = out_dir or root / "clips"
 
-    pass2a = Pass2aResult.model_validate_json(shaped.read_text())
+    shape_result = ShapeResult.model_validate_json(shaped.read_text())
     tr = Transcript.model_validate_json(transcript_path.read_text())
     tr_sha = _sha256_file(transcript_path)
 
@@ -261,9 +452,10 @@ def render(
         out_dir=out_dir,
         manifest_path=manifest,
         skip_existing=not no_skip,
+        log_path=root / "logs" / "render.jsonl",
     )
 
-    result = run_pass2b(pass2a, tr, tr_sha, video, cfg=cfg)
+    result = run_render(shape_result, tr, tr_sha, video, cfg=cfg)
     log.info(
         "rendered %d, skipped_kill=%d, skipped_fp=%d, failed=%d",
         result.renders_completed,
@@ -273,22 +465,104 @@ def render(
     )
 
 
+@app.command()
+def post(
+    clip_path: Path = typer.Argument(
+        ..., exists=True, readable=True, help="Path to rendered MP4"
+    ),
+    platform: str = typer.Option(
+        ..., "--platform", help="Platform name, e.g. shorts, tiktok, linkedin"
+    ),
+    post_id: str = typer.Option(
+        ..., "--post-id", help="Platform-assigned post identifier"
+    ),
+    post_url: str | None = typer.Option(None, "--post-url"),
+    title: str | None = typer.Option(None, "--title"),
+    posted_at: str | None = typer.Option(
+        None, "--posted-at", help="ISO8601 UTC; defaults to now"
+    ),
+    notes: str | None = typer.Option(None, "--notes"),
+    manifest: Path | None = typer.Option(
+        None, "--manifest",
+        help="rendered.json path (defaults to <clip-parent>/rendered.json)",
+    ),
+    output_dir: Path | None = typer.Option(
+        None, "--output-dir", "-O",
+        help="Per-video output root (defaults to <rendered.json parent>/..)",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Record that a rendered clip was posted to a platform."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("clipper.cli")
+
+    manifest_path = manifest or clip_path.parent / "rendered.json"
+    try:
+        matched, stem_root = resolve_identity(clip_path, manifest_path)
+    except FileNotFoundError as e:
+        raise typer.BadParameter(str(e)) from e
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+
+    root = output_dir or stem_root
+    log_path = root / "logs" / "posted.jsonl"
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        row = PostedClip(
+            ts=now,
+            shaped_candidate_index=matched.shaped_candidate_index,
+            video_stem=stem_root.name,
+            source_video_sha256=matched.source_video_sha256,
+            output_path=str(Path(matched.output_path).resolve()),
+            output_sha256=matched.output_sha256,
+            render_version=matched.render_version,
+            source_shaped_prompt_version=matched.source_shaped_prompt_version,
+            source_score_prompt_version=matched.source_score_prompt_version,
+            platform=platform,
+            post_id=post_id,
+            post_url=post_url,
+            title=title,
+            posted_at=posted_at or now,
+            notes=notes,
+        )
+    except Exception as e:
+        raise typer.BadParameter(str(e)) from e
+
+    append_posted(log_path, row)
+    log.info(
+        "wrote %s — shaped_candidate_index=%d platform=%s post_id=%s",
+        log_path,
+        row.shaped_candidate_index,
+        row.platform,
+        row.post_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _write_transcript_sidecar(shaped_out: Path, transcript: Transcript) -> Path:
-    """Write `<shaped_out>.transcript.json` atomically next to the shaped JSON."""
-    sidecar = Path(str(shaped_out) + ".transcript.json")
-    tmp = sidecar.with_suffix(sidecar.suffix + ".tmp")
+def _atomic_write_json(path: Path, model) -> Path:
+    """Write a pydantic model to `path` atomically (.tmp + os.replace)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
     try:
-        tmp.write_text(transcript.model_dump_json(indent=2))
+        tmp.write_text(model.model_dump_json(indent=2))
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    os.replace(tmp, sidecar)
-    return sidecar
+    os.replace(tmp, path)
+    return path
+
+
+def _write_transcript_sidecar(root: Path, transcript: Transcript) -> Path:
+    """Write `<root>/transcript.json` atomically."""
+    return _atomic_write_json(root / "transcript.json", transcript)
 
 
 def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:

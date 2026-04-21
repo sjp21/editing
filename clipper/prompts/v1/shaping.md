@@ -45,8 +45,7 @@ Both `start_word` and `end_word` must be real words from the provided word table
 
 ---
 
-<!-- [PLATFORM_PROFILE]
-Platform-specific taste (tiktok.md, linkedin.md, shorts.md) is injected here when profiles land. When a profile asks for something that cuts against your craft values — a hotter hook, a shorter length, more aggressive opens — follow the profile and note the tension in `reasoning`. Authority order: feedback loop > profile > craft. Until then, this section is empty. -->
+<!-- [PLATFORM_PROFILE] -->
 
 ---
 

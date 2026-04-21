@@ -9,8 +9,8 @@ from types import SimpleNamespace
 import anthropic
 import pytest
 
-from clipper import pass1
-from clipper.pass1 import Pass1Config, run_pass1
+from clipper import score
+from clipper.score import ScoreConfig, run_score
 from clipper.schemas import (
     AudioFeature,
     Frame,
@@ -142,13 +142,13 @@ class _FakeClient:
 def test_rejected_window_captures_filter_reason(monkeypatch):
     """Stage 1 rejection → WindowDiagnostic records the reason and zero candidates."""
     # Skip frame encoding (paths don't exist).
-    monkeypatch.setattr(pass1, "_select_frames", lambda w, limit: [])
-    monkeypatch.setattr(pass1.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(score, "_select_frames", lambda w, limit: [])
+    monkeypatch.setattr(score.time, "sleep", lambda *_: None)
 
     w = _window(index=0, n_text=5, n_audio=3, n_frames=4, n_event_frames=2)
     client = _FakeClient([_response(_reject_json("pure logistics — setup banter"))])
 
-    result = run_pass1([w], cfg=Pass1Config(), client=client)
+    result = run_score([w], cfg=ScoreConfig(), client=client)
 
     assert len(result.window_diagnostics) == 1
     diag = result.window_diagnostics[0]
@@ -168,13 +168,13 @@ def test_rejected_window_captures_filter_reason(monkeypatch):
 
 def test_accepted_window_has_no_filter_reason(monkeypatch):
     """Non-empty candidates → filter_reason stays None."""
-    monkeypatch.setattr(pass1, "_select_frames", lambda w, limit: [])
-    monkeypatch.setattr(pass1.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(score, "_select_frames", lambda w, limit: [])
+    monkeypatch.setattr(score.time, "sleep", lambda *_: None)
 
     w = _window(index=2)
     client = _FakeClient([_response(_candidate_json(start=100.0, end=117.0))])
 
-    result = run_pass1([w], cfg=Pass1Config(), client=client)
+    result = run_score([w], cfg=ScoreConfig(), client=client)
 
     assert len(result.candidates) == 1
     diag = result.window_diagnostics[0]
@@ -187,14 +187,14 @@ def test_accepted_window_has_no_filter_reason(monkeypatch):
 
 def test_call_failure_records_unsucceeded_diagnostic(monkeypatch):
     """Exhausted retries → WindowDiagnostic with call_succeeded=False."""
-    monkeypatch.setattr(pass1, "_select_frames", lambda w, limit: [])
-    monkeypatch.setattr(pass1.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(score, "_select_frames", lambda w, limit: [])
+    monkeypatch.setattr(score.time, "sleep", lambda *_: None)
 
     w = _window(index=7)
     # Malformed on every attempt (max_retries=2 → 3 calls total).
     client = _FakeClient([_response("not json") for _ in range(5)])
 
-    result = run_pass1([w], cfg=Pass1Config(), client=client)
+    result = run_score([w], cfg=ScoreConfig(), client=client)
 
     assert result.candidates == []
     assert len(result.window_diagnostics) == 1
@@ -210,13 +210,13 @@ def test_call_failure_records_unsucceeded_diagnostic(monkeypatch):
 
 def test_rejection_without_filter_reason_stays_none(monkeypatch):
     """Older / non-conforming responses that omit filter_reason are tolerated."""
-    monkeypatch.setattr(pass1, "_select_frames", lambda w, limit: [])
-    monkeypatch.setattr(pass1.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(score, "_select_frames", lambda w, limit: [])
+    monkeypatch.setattr(score.time, "sleep", lambda *_: None)
 
     w = _window(index=1)
     client = _FakeClient([_response(json.dumps({"candidates": []}))])
 
-    result = run_pass1([w], cfg=Pass1Config(), client=client)
+    result = run_score([w], cfg=ScoreConfig(), client=client)
 
     diag = result.window_diagnostics[0]
     assert diag.candidates_returned == 0
@@ -225,13 +225,13 @@ def test_rejection_without_filter_reason_stays_none(monkeypatch):
 
 
 def test_prompt_version_stamped_on_candidate(monkeypatch):
-    """run_pass1 stamps PROMPT_VERSION (v2) onto every candidate."""
-    monkeypatch.setattr(pass1, "_select_frames", lambda w, limit: [])
-    monkeypatch.setattr(pass1.time, "sleep", lambda *_: None)
+    """run_score stamps PROMPT_VERSION (v2) onto every candidate."""
+    monkeypatch.setattr(score, "_select_frames", lambda w, limit: [])
+    monkeypatch.setattr(score.time, "sleep", lambda *_: None)
 
     w = _window(index=0)
     client = _FakeClient([_response(_candidate_json())])
-    result = run_pass1([w], cfg=Pass1Config(), client=client)
+    result = run_score([w], cfg=ScoreConfig(), client=client)
 
     assert result.prompt_version == "v2"
     assert result.candidates[0].prompt_version == "v2"

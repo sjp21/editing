@@ -1,16 +1,16 @@
-"""Pass 2a — Shaping.
+"""Shape — word-aligned trims and hook treatments.
 
-For each candidate produced by Pass 1, send the candidate metadata, ±30s
-of transcript context, and a word-level timestamp table to Claude. The
-model returns a keep/kill verdict plus (on keep) an exact word-aligned
-trim and a hook treatment. Output is a ``Pass2aResult``.
+For each candidate produced by the scorer, send the candidate metadata,
+±30s of transcript context, and a word-level timestamp table to Claude.
+The model returns a keep/kill verdict plus (on keep) an exact word-aligned
+trim and a hook treatment. Output is a ``ShapeResult``.
 
-Reasoning only — no frames. Frames are Pass 2b's concern.
+Reasoning only — no frames. Frames are the renderer's concern.
 
 Observability:
 - System prompt (rubric) is cached via ``cache_control: ephemeral``.
-- Token usage aggregates into ``Pass2aResult``.
-- Each shaped candidate appends one JSONL line to the pass2a log so the
+- Token usage aggregates into ``ShapeResult``.
+- Each shaped candidate appends one JSONL line to the shape log so the
   eventual feedback loop has the data regardless of outcome.
 """
 
@@ -27,11 +27,12 @@ from pathlib import Path
 
 import anthropic
 
+from clipper._profiles import inject_profile, load_profile
 from clipper.schemas import (
     Candidate,
     HookTreatment,
-    Pass1Result,
-    Pass2aResult,
+    ScoreResult,
+    ShapeResult,
     ShapedClip,
     ShapedTrim,
     Transcript,
@@ -46,31 +47,39 @@ PROMPT_VERSION = "v1"
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_CONTEXT_PAD = 30.0
 DEFAULT_WORD_TABLE_PAD = 5.0
-DEFAULT_LOG_PATH = Path(".cache/logs/pass2a.jsonl")
 TRIM_SLACK = 2.0
 WORD_TIMESTAMP_TOLERANCE = 0.05
 
 
 @dataclass
-class Pass2aConfig:
+class ShapeConfig:
     model: str = DEFAULT_MODEL
     prompt_path: Path | None = None
-    max_tokens: int = 2048
+    max_tokens: int = 8192
     max_retries: int = 2
     effort: str = "high"
     context_pad: float = DEFAULT_CONTEXT_PAD
     word_table_pad: float = DEFAULT_WORD_TABLE_PAD
-    log_path: Path | None = DEFAULT_LOG_PATH
+    log_path: Path | None = None
+    profile: str | None = None
+    profiles_dir: Path | None = None
 
 
-def _load_rubric(prompt_path: Path | None) -> str:
+def _load_rubric(
+    prompt_path: Path | None,
+    profile: str | None = None,
+    profiles_dir: Path | None = None,
+) -> str:
     if prompt_path is not None:
-        return Path(prompt_path).read_text()
-    return (
-        resources.files("clipper")
-        .joinpath(f"prompts/{PROMPT_VERSION}/shaping.md")
-        .read_text(encoding="utf-8")
-    )
+        rubric = Path(prompt_path).read_text()
+    else:
+        rubric = (
+            resources.files("clipper")
+            .joinpath(f"prompts/{PROMPT_VERSION}/shaping.md")
+            .read_text(encoding="utf-8")
+        )
+    profile_text = load_profile(profile, profiles_dir, PROMPT_VERSION)
+    return inject_profile(rubric, profile_text)
 
 
 # ---------------------------------------------------------------------------
@@ -123,24 +132,27 @@ def _format_words_table(words: list[TranscriptWord]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_pass2a(
-    pass1: Pass1Result,
+def run_shape(
+    scored: ScoreResult,
     transcript: Transcript,
-    cfg: Pass2aConfig | None = None,
+    cfg: ShapeConfig | None = None,
     client: anthropic.Anthropic | None = None,
-) -> Pass2aResult:
-    cfg = cfg or Pass2aConfig()
+    source_ranker_prompt_version: str | None = None,
+) -> ShapeResult:
+    cfg = cfg or ShapeConfig()
     client = client or anthropic.Anthropic()
-    rubric = _load_rubric(cfg.prompt_path)
+    rubric = _load_rubric(cfg.prompt_path, cfg.profile, cfg.profiles_dir)
 
-    result = Pass2aResult(
+    result = ShapeResult(
         shaped=[],
         model=cfg.model,
         prompt_version=PROMPT_VERSION,
-        source_pass1_prompt_version=pass1.prompt_version,
+        source_score_prompt_version=scored.prompt_version,
+        source_ranker_prompt_version=source_ranker_prompt_version,
+        profile=cfg.profile,
     )
 
-    for idx, cand in enumerate(pass1.candidates):
+    for idx, cand in enumerate(scored.candidates):
         ctx_segs, ctx_words = _extract_context(
             transcript, cand.start_seconds, cand.end_seconds, pad=cfg.context_pad
         )
@@ -173,7 +185,14 @@ def run_pass2a(
         )
 
         if cfg.log_path is not None:
-            _append_log(cfg.log_path, shaped, usage, pass1.prompt_version)
+            _append_log(
+                cfg.log_path,
+                shaped,
+                usage,
+                scored.prompt_version,
+                source_ranker_prompt_version,
+                profile=cfg.profile,
+            )
 
     return result
 
@@ -185,7 +204,7 @@ def _shape_candidate(
     ctx_segs: list[TranscriptSegment],
     ctx_words: list[TranscriptWord],
     rubric: str,
-    cfg: Pass2aConfig,
+    cfg: ShapeConfig,
 ) -> tuple[ShapedClip, dict]:
     user_text = _build_user_message(cand, idx, ctx_segs, ctx_words, cfg)
 
@@ -227,7 +246,7 @@ def _build_user_message(
     idx: int,
     ctx_segs: list[TranscriptSegment],
     ctx_words: list[TranscriptWord],
-    cfg: Pass2aConfig,
+    cfg: ShapeConfig,
 ) -> str:
     before = [s for s in ctx_segs if s.end <= cand.start_seconds]
     inside = _segments_in_range(ctx_segs, cand.start_seconds, cand.end_seconds)
@@ -245,8 +264,8 @@ def _build_user_message(
         f"source_start: {cand.start_seconds:.2f}\n"
         f"source_end: {cand.end_seconds:.2f}\n"
         f"overall_score: {cand.overall_score:.2f}\n"
-        f"suggested_hook (from Pass 1): {cand.suggested_hook!r}\n"
-        f"pass1_rationale: {cand.rationale}"
+        f"suggested_hook (from scorer): {cand.suggested_hook!r}\n"
+        f"score_rationale: {cand.rationale}"
     )
 
     body_parts = [
@@ -297,7 +316,7 @@ def _parse_and_validate(
     cand: Candidate,
     idx: int,
     ctx_words: list[TranscriptWord],
-    cfg: Pass2aConfig,
+    cfg: ShapeConfig,
 ) -> ShapedClip:
     t = text.strip()
     if t.startswith("```"):
@@ -318,7 +337,7 @@ def _parse_and_validate(
     hook = HookTreatment(**hook_raw) if hook_raw else None
 
     shaped = ShapedClip(
-        candidate_index=idx,
+        candidate_index=cand.score_index if cand.score_index is not None else idx,
         source_start=cand.start_seconds,
         source_end=cand.end_seconds,
         verdict=payload["verdict"],
@@ -391,15 +410,19 @@ def _append_log(
     path: Path,
     shaped: ShapedClip,
     usage: dict,
-    source_pass1_prompt_version: str,
+    source_score_prompt_version: str,
+    source_ranker_prompt_version: str | None = None,
+    profile: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "stage": "pass2a",
+        "stage": "shape",
         "prompt_version": shaped.prompt_version,
         "model": shaped.model,
-        "source_pass1_prompt_version": source_pass1_prompt_version,
+        "source_score_prompt_version": source_score_prompt_version,
+        "source_ranker_prompt_version": source_ranker_prompt_version,
+        "profile": profile,
         "candidate_index": shaped.candidate_index,
         "source_start": shaped.source_start,
         "source_end": shaped.source_end,
