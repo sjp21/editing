@@ -20,3 +20,7 @@ artifacts/
 candidates.json
 *.candidates.json
 outputs/
+
+# Planning + debug scratch
+plan*.md
+debug*.md
