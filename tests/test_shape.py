@@ -197,7 +197,10 @@ def test_format_words_table_is_one_per_line():
     words = [TranscriptWord(start=12.34, end=12.5, word="Hi"),
              TranscriptWord(start=12.56, end=12.8, word="there.")]
     out = _format_words_table(words)
-    assert out.splitlines() == ['t=12.34 "Hi"', 't=12.56 "there."']
+    assert out.splitlines() == [
+        't_start=12.34 t_end=12.50 "Hi"',
+        't_start=12.56 t_end=12.80 "there."',
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -274,6 +277,42 @@ def test_parse_rejects_word_timestamp_mismatch():
     end_word = _find_word_at(words_spec, 115.0, "end")  # "every"
     text = _keep_json(
         start=101.0, end=115.0, start_word="Most", end_word=end_word
+    )
+    _, ctx_words = _extract_context(tr, cand.start_seconds, cand.end_seconds, pad=30.0)
+    with pytest.raises(ValueError, match="does not match"):
+        _parse(text, cand, ctx_words)
+
+
+def test_parse_rejects_end_word_quoted_at_its_start_timestamp():
+    """Regression for the v2 word-table bug.
+
+    In v2 the word table only exposed ``w.start`` as ``t=``, so models
+    would quote that same timestamp as ``end_seconds`` for the end word.
+    The validator compares ``end_seconds`` against ``w.end``, so the
+    claimed word never matched — except that an earlier, adjacent word
+    typically ended at that exact timestamp, producing a confusing
+    "delta: 0.000s" error with a silently mis-cut clip if the validator
+    had been relaxed.
+
+    The v3 fix surfaces ``t_end`` in the word table and instructs the
+    model to align ``end_seconds`` to ``t_end``. If the model still
+    hands us an end_word quoted at its start timestamp (an upstream
+    regression in the rubric), the validator must keep rejecting it.
+    """
+    # Two contiguous words: A ends exactly where B starts. This is the
+    # shape of the transcript at the Brooklyn failure (`-eyed` ending at
+    # 120.48, ` fish,` starting at 120.48).
+    words_spec = _default_words()  # 20s, all words exactly 1s long
+    tr = _build_transcript(words_spec)
+    cand = _candidate(100.0, 117.0)
+    # Pick an end_word whose t_start is the t_end of the previous word —
+    # a 0-gap transcript boundary, which is the common shape of the bug.
+    # "charging" has t_start=115.0 and t_end=116.0, and the previous word
+    # "are" has t_end=115.0. So quoting end_word="charging" at
+    # end_seconds=115.0 would collide textually with "are" under a naive
+    # validator: 115.0 is charging's t_start but also are's t_end.
+    text = _keep_json(
+        start=100.0, end=115.0, start_word="Most", end_word="charging"
     )
     _, ctx_words = _extract_context(tr, cand.start_seconds, cand.end_seconds, pad=30.0)
     with pytest.raises(ValueError, match="does not match"):

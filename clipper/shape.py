@@ -43,7 +43,7 @@ from clipper.schemas import (
 log = logging.getLogger(__name__)
 
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_CONTEXT_PAD = 30.0
 DEFAULT_WORD_TABLE_PAD = 5.0
@@ -125,7 +125,9 @@ def _format_transcript_block(segs: list[TranscriptSegment]) -> str:
 
 
 def _format_words_table(words: list[TranscriptWord]) -> str:
-    return "\n".join(f't={w.start:.2f} "{w.word}"' for w in words)
+    return "\n".join(
+        f't_start={w.start:.2f} t_end={w.end:.2f} "{w.word}"' for w in words
+    )
 
 
 # ---------------------------------------------------------------------------
