@@ -479,3 +479,59 @@ class RankedCandidates(BaseModel):
                     f"which is not in ranked"
                 )
         return self
+
+
+# ---------------------------------------------------------------------------
+# Hand-labeled eval (clipper eval)
+# ---------------------------------------------------------------------------
+
+
+class LabeledClip(BaseModel):
+    start: float
+    end: float
+    tier: Literal["must_ship", "nice", "marginal", "rejected"]
+    reason: str
+
+    @model_validator(mode="after")
+    def _validate_timing(self) -> "LabeledClip":
+        if self.end <= self.start:
+            raise ValueError(
+                f"end ({self.end}) must be > start ({self.start})"
+            )
+        return self
+
+
+class HumanLabels(BaseModel):
+    video_stem: str
+    labeler: str
+    labeled_at: str
+    labels: list[LabeledClip]
+    schema_version: Literal[1] = 1
+
+
+class LabelMatch(BaseModel):
+    label_index: int
+    tier: Literal["must_ship", "nice", "marginal", "rejected"]
+    reason: str
+    matched_score_index: int | None = None
+    iou: float | None = None
+    # None when the ranker did not run for this video.
+    in_ranker_topk: bool | None = None
+    # `keep`/`kill` come from ShapedClip.verdict on the matched candidate.
+    # `missing` = matched candidate was filtered by the ranker (never reached shape).
+    # `failed`  = shape ran but did not emit a result for this candidate.
+    # None      = no matched candidate, or shape did not run.
+    shape_verdict: Literal["keep", "kill", "missing", "failed"] | None = None
+
+
+class LabelScorecard(BaseModel):
+    video_stem: str
+    eval_version: Literal[1] = 1
+    iou_threshold: float = 0.5
+    scorer_recall: float
+    ranker_inclusion: float
+    shape_alignment: float
+    matches: list[LabelMatch]
+    misses: list[int]
+    false_positives: list[int]
+    timestamp: str

@@ -14,6 +14,7 @@ import typer
 from dotenv import load_dotenv
 
 from clipper._posted import append_posted, resolve_identity
+from clipper.eval import run_eval
 from clipper.frames import extract_frames
 from clipper.ingest import IngestConfig, extract_audio, transcribe
 from clipper.score import DEFAULT_MODEL, ScoreConfig, run_score
@@ -539,6 +540,74 @@ def post(
         row.shaped_candidate_index,
         row.platform,
         row.post_id,
+    )
+
+
+@app.command(name="eval")
+def eval_cmd(
+    video_stem: str = typer.Option(
+        ..., "--video-stem", help="Per-video stem (resolves to outputs/<stem>/)"
+    ),
+    output_dir: Path = typer.Option(
+        None, "--output-dir", "-O",
+        help="Per-video output root (default: outputs/<video-stem>)",
+    ),
+    labels: Path = typer.Option(
+        None, "--labels", help="human_labels.json (default: <output-dir>/human_labels.json)"
+    ),
+    candidates: Path = typer.Option(
+        None, "--candidates", help="candidates.json (default: <output-dir>/candidates.json)"
+    ),
+    ranked: Path = typer.Option(
+        None, "--ranked", help="ranked.json (default: <output-dir>/ranked.json)"
+    ),
+    shaped: Path = typer.Option(
+        None, "--shaped", help="shaped.json (default: <output-dir>/shaped.json)"
+    ),
+    iou_threshold: float = typer.Option(
+        0.5, "--iou-threshold", help="Min IoU to count a candidate as matching a label"
+    ),
+    out: Path = typer.Option(
+        None, "--out", "-o",
+        help="Scorecard output JSON (default: <output-dir>/eval.json)",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Score the pipeline against hand-written labels."""
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    log = logging.getLogger("clipper.cli")
+
+    root = output_dir or Path("outputs") / video_stem
+    out = out or root / "eval.json"
+    log_path = root / "logs" / "eval.jsonl"
+
+    scorecard = run_eval(
+        video_stem,
+        output_dir=root,
+        iou_threshold=iou_threshold,
+        labels_path=labels,
+        candidates_path=candidates,
+        ranked_path=ranked,
+        shaped_path=shaped,
+    )
+
+    _atomic_write_json(out, scorecard)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(scorecard.model_dump_json() + "\n")
+
+    log.info(
+        "wrote %s — recall=%.2f inclusion=%.2f shape=%.2f "
+        "(misses=%d false_positives=%d)",
+        out,
+        scorecard.scorer_recall,
+        scorecard.ranker_inclusion,
+        scorecard.shape_alignment,
+        len(scorecard.misses),
+        len(scorecard.false_positives),
     )
 
 
