@@ -30,16 +30,18 @@ The project has a clean typed JSON seam at `ScoreResult`. Every future stage fol
 
 If a change would erase or muddy a stage boundary, that is a signal to stop and reconsider.
 
+Taste lives in one more cross-stage artifact: `clipper/SOUL.md`, loaded by both the ranker and the shaper. The JSON seam governs *format*; SOUL governs *editorial priors*. Platform profiles override SOUL for platform-specific taste; the feedback loop overrides both. Keeping taste in one shared file — rather than letting it fragment into per-stage rubrics — is what makes retro-rubric updates (below) a single thing to rewrite instead of N things kept in sync.
+
 ## Stage map
 
 ### Score — Candidate identification (built)
-Finds 15–20s candidate segments. Output: `ScoreResult`. Do not extend this stage with cropping, captioning, ranking, or shaping logic.
+Finds 15–20s candidate segments. Output: `ScoreResult`. Do not extend this stage with cropping, captioning, ranking, or shaping logic. The scorer's `hook_strength` dimension measures attention capture in the first ~2 seconds; this is load-bearing for the whole pipeline — a clip with a weak first beat cannot be salvaged downstream, so scorer thresholds on hook_strength dominate selection. The 15–20s duration constraint is a default inherited from the profile layer — see §Platform profiles.
 
 ### Global ranker (next conceptual stage)
 The scorer's deduplication is per-window and cannot catch semantic near-duplicates (e.g., the same story told twice) or rank across the whole video. A single Claude call that sees all candidates at once returns a ranked top-K with per-clip justifications and a diversity constraint. Output: `RankedCandidates`. This is the stage that makes "best moments" mean best, not merely "passed threshold."
 
 ### Shape (reasoning)
-Per-candidate Claude call with transcript ±30s of context and word-level timestamps. Returns an exact trim (to the word), a hook rewrite or overlay suggestion, and a keep/kill verdict. Output: `ShapedClip`. Pure reasoning — cacheable and testable in isolation.
+Per-candidate Claude call with transcript ±30s of context and word-level timestamps. Returns an exact trim (to the word), a hook rewrite or overlay suggestion, and a keep/kill verdict. Output: `ShapedClip`. Pure reasoning — cacheable and testable in isolation. The shaper is expected to trim aggressively from the top — the first ~0.8 seconds decides whether the rest is watched, so over-trimming the opening is a recoverable error and under-trimming is not.
 
 ### Render (deterministic)
 A deterministic pipeline that takes a `ShapedClip` and produces a finished, platform-ready file. It must:
@@ -47,7 +49,7 @@ A deterministic pipeline that takes a `ShapedClip` and produces a finished, plat
 - **Reframe to 9:16** using a face/subject tracker with a smoothed crop window. Multi-subject scenes may need a more capable segmenter.
 - **Burn word-by-word highlighted captions** sourced from the existing word-level timestamps. This is the single highest-leverage retention feature.
 - **Normalize loudness** to a platform-appropriate target. Non-negotiable; skipping this is why AI-made clips sound "off."
-- **Emphasize the hook** — optionally, a brief zoom or text overlay on the first ~0.8s, sourced from the shaping step.
+- **Reinforce the shaped hook** — optionally, a brief zoom or text overlay on the first ~0.8s, sourced from the shaping step. This is presentation, not selection; a clip that needs the overlay to have a hook should have been killed by shape.
 
 Output: a rendered file plus a `RenderedClip` manifest. Specific library choices (face tracker, segmenter, loudness target, renderer) live in `docs/technical-decisions.md` because they age faster than this document should.
 
@@ -56,6 +58,8 @@ Optional post-render export for users who want to take over the final edit thems
 
 ### Platform profiles
 What "good" means is platform-specific. Externalize this as versioned prompt fragments (`profiles/tiktok.md`, `profiles/linkedin.md`, `profiles/shorts.md`) describing hook expectations, arousal level, length sweet spot, and caption density. The ranker and shaper both load the active profile. Benefits: one place to iterate on taste, natural A/B testing across profiles, and a clean target for the feedback loop to rewrite later.
+
+The current 15–20s hard cap on `Candidate.duration_seconds` is an unvalidated default, not a platform-universal truth — TikTok's FYP sweet spot runs longer, Shorts caps at 60s, LinkedIn tolerates 45–90s explanatory clips. Length targets are a per-profile parameter; the schema's hard cap will be relaxed to a per-profile range once the feedback loop (or the hand-labeled eval) shows a profile is length-starved. Until then, 15–20s is a working assumption that errs toward short-form-native pacing.
 
 ### Feedback loop
 Treated as its own first-class stage, not an afterthought. See the next section.
@@ -73,6 +77,8 @@ Given those constraints, the approach is:
 
 **Two-tier feedback capture.** Implicit: which clips the user actually posts (a quiet but strong preference signal). Explicit: platform performance metrics pulled back via the platforms' public APIs, keyed on post IDs. A `published_clips` table joins renders to outcomes.
 
+**Precision backstop via hand labels.** Both tiers above require a clip to be posted. Clips the system would have shipped that the user vetoes in review never get posted, so they never generate outcome data — platform metrics alone measure recall of good picks but not precision against bad ones. A hand-labeled eval set (see `hand-labeled-regression-process.md`) serves as an interim precision signal until enough rejection-equivalent data accumulates automatically. Labels are per-video, tiered (`must_ship`, `nice`, `marginal`, `rejected`), and feed the retro job's input alongside platform metrics — the `rejected` tier being the only signal that ever sees false positives.
+
 **Retrospective rubric updates, not model training.** Periodically (e.g., every ~20 posted clips), a retro job has Claude read top and bottom performers side by side with their features and produces an updated rubric appendix. That appendix becomes part of the cached system prompt for future runs. This is RAG on the project's own performance history, using Claude's reasoning in place of a model there is not yet data to train. It is also legible — a human can read why the system changed its mind.
 
 **A lightweight learned ranker, only later.** Once hundreds of outcomes exist, a gradient-boosted ranker over candidate features (predicting retention%) can serve as a cheap pre-filter before the Claude call. Do not build this early; the retro-rubric approach dominates until the data is there.
@@ -86,9 +92,10 @@ Each step is independently valuable and preserves the seams:
 3. Shape — sharpens trims and hooks.
 4. Platform profiles — externalizes taste.
 5. Logging infrastructure and manual outcome entry — starts the flywheel.
-6. Platform API integrations — automates outcome capture.
-7. Retrospective rubric updates — closes the learning loop.
-8. Learned ranker — only when data supports it.
+6. Hand-labeled eval scorecard — interim precision signal and regression gate for every rubric change until platform metrics exist.
+7. Platform API integrations — automates outcome capture.
+8. Retrospective rubric updates — closes the learning loop.
+9. Learned ranker — only when data supports it.
 
 ## Non-goals (for now)
 
