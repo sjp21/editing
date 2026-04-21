@@ -366,15 +366,15 @@ def test_process_profile_threads_to_ranker_and_shape(tmp_path, monkeypatch):
             "--output-dir", str(tmp_path / "out"),
             "--rank",
             "--shape",
-            "--profile", "shorts",
+            "--profile", "default",
         ],
         catch_exceptions=False,
     )
     assert result.exit_code == 0, result.output
     assert len(ranker_cfgs) == 1
-    assert ranker_cfgs[0].profile == "shorts"
+    assert ranker_cfgs[0].profile == "default"
     assert len(shape_cfgs) == 1
-    assert shape_cfgs[0].profile == "shorts"
+    assert shape_cfgs[0].profile == "default"
 
 
 def test_post_writes_posted_jsonl_under_stem_logs(tmp_path):

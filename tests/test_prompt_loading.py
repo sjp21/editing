@@ -73,11 +73,14 @@ def test_soul_bundled_in_package(tmp_path, monkeypatch):
     assert path.is_file()
 
 
-def test_shorts_profile_bundled_in_package():
-    """The one shipped platform profile must travel with the installed wheel."""
+@pytest.mark.parametrize("profile_name", ["default"])
+def test_platform_profile_bundled_in_package(profile_name):
+    """All shipped platform profiles must travel with the installed wheel."""
     from importlib import resources
 
-    path = resources.files("clipper").joinpath("prompts/v1/profiles/shorts.md")
+    path = resources.files("clipper").joinpath(
+        f"prompts/v1/profiles/{profile_name}.md"
+    )
     assert path.is_file()
 
 

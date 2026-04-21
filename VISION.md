@@ -51,6 +51,9 @@ A deterministic pipeline that takes a `ShapedClip` and produces a finished, plat
 
 Output: a rendered file plus a `RenderedClip` manifest. Specific library choices (face tracker, segmenter, loudness target, renderer) live in `docs/technical-decisions.md` because they age faster than this document should.
 
+### Manual editing handoff (future)
+Optional post-render export for users who want to take over the final edit themselves. When a shaped clip is composed of multiple sub-segments stitched from non-contiguous parts of the source (e.g., a 10–15s clip the shaper assembled from several takes), the system should be able to emit each sub-segment as its own file cut from the original video, plus a manifest of in/out timecodes keyed to the `ShapedClip`. The target use case is DaVinci Resolve and similar NLEs: the system does identification, selection, and assembly; the user does the polish. Seam-respecting shape: a separate stage reading `ShapedClip` + source video, writing loose source-cut sub-clips and a timecode manifest, leaving the main render output untouched.
+
 ### Platform profiles
 What "good" means is platform-specific. Externalize this as versioned prompt fragments (`profiles/tiktok.md`, `profiles/linkedin.md`, `profiles/shorts.md`) describing hook expectations, arousal level, length sweet spot, and caption density. The ranker and shaper both load the active profile. Benefits: one place to iterate on taste, natural A/B testing across profiles, and a clean target for the feedback loop to rewrite later.
 

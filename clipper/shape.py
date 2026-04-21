@@ -43,11 +43,12 @@ from clipper.schemas import (
 log = logging.getLogger(__name__)
 
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 DEFAULT_MODEL = "claude-opus-4-7"
 DEFAULT_CONTEXT_PAD = 30.0
 DEFAULT_WORD_TABLE_PAD = 5.0
-TRIM_SLACK = 2.0
+TRIM_SLACK_START = 2.0
+TRIM_SLACK_END = 5.0
 WORD_TIMESTAMP_TOLERANCE = 0.05
 
 
@@ -357,12 +358,13 @@ def _parse_and_validate(
 
 
 def _enforce_trim_bounds(trim: ShapedTrim, cand: Candidate) -> None:
-    lo = cand.start_seconds - TRIM_SLACK
-    hi = cand.end_seconds + TRIM_SLACK
+    lo = cand.start_seconds - TRIM_SLACK_START
+    hi = cand.end_seconds + TRIM_SLACK_END
     if trim.start_seconds < lo - 1e-6 or trim.end_seconds > hi + 1e-6:
         raise ValueError(
             f"trim [{trim.start_seconds:.2f}, {trim.end_seconds:.2f}] outside "
-            f"candidate ±{TRIM_SLACK}s bounds [{lo:.2f}, {hi:.2f}]"
+            f"candidate slack bounds [{lo:.2f}, {hi:.2f}] "
+            f"(-{TRIM_SLACK_START}s / +{TRIM_SLACK_END}s)"
         )
 
 

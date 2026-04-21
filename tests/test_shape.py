@@ -339,7 +339,7 @@ def test_run_shape_aggregates_and_logs(monkeypatch, tmp_path):
     assert result.cache_read_tokens == 200
     assert result.cache_creation_tokens == 200
     assert result.source_score_prompt_version == "v1"
-    assert result.prompt_version == "v1"
+    assert result.prompt_version == shape.PROMPT_VERSION
 
     # candidate_index is preserved positionally.
     indices = [s.candidate_index for s in result.shaped]
